@@ -2,7 +2,7 @@
 
 Skills are how Hermes specializes. A skill is a self-contained folder with a charter (what it does, when to invoke), supporting reference docs, and executable scripts. Hermes' Curator grades, prunes, and consolidates skills on a 7-day cycle.
 
-This repo includes [`skills/alpha-desk/`](../skills/alpha-desk/) as a full worked example — an equity research workflow.
+This repo includes [`skills/alpha-desk/`](../skills/alpha-desk/) as a full worked example - an NSE intraday (MIS) paper-trading desk for the Nifty 500.
 
 ## Required structure
 

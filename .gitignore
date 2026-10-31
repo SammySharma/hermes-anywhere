@@ -44,3 +44,6 @@ scratch/
 
 # Claude Code local state
 .claude/
+
+# Skill runtime data (paper-trading book, logs, caches)
+skills/*/data/
