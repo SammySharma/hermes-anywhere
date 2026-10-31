@@ -117,7 +117,7 @@ hermes-anywhere/
 │   ├── aws-lightsail/        # medium_3_0, $20/mo
 │   └── digitalocean/         # s-2vcpu-4gb, $24/mo
 ├── skills/
-│   └── alpha-desk/           # example skill — equity research workflow
+│   └── alpha-desk/           # example skill - NSE intraday (MIS) paper-trading desk
 ├── scripts/
 └── docs/
     ├── COSTS.md              # full cost comparison

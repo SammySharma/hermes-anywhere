@@ -1,146 +1,139 @@
 #!/usr/bin/env python3
-"""Portfolio performance analytics and self-improvement for Alpha Desk."""
+"""Intraday performance analytics and review loop for Alpha Desk (reads the closed trades in portfolio.json)."""
 
-import sys
+import argparse
 import json
-import os
-from datetime import datetime
+from datetime import timedelta
 
-DATA_DIR = os.path.expanduser("~/.hermes/skills/finance/alpha-desk/data")
-PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
-DECISIONS_FILE = os.path.join(DATA_DIR, "decisions_log.json")
+from market_data import get_history, now_ist
+from portfolio import PORTFOLIO_FILE, load_json, lock, log_decision
+
+MIN_SAMPLE = 20  # closed trades in a bucket before a rule change is justified
 
 
-def load_json(path):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return None
+def stats(ts):
+    if not ts:
+        return {"trades": 0}
+    net = [t["net"] for t in ts]
+    wins, losses = [x for x in net if x > 0], [x for x in net if x < 0]
+    gp, gl = sum(wins), -sum(losses)
+    run = peak = dd = 0.0
+    for x in net:
+        run += x
+        peak = max(peak, run)
+        dd = max(dd, peak - run)
+    gross, fees = sum(t["gross"] for t in ts), sum(t["fees"] for t in ts)
+    rs = [t["r"] for t in ts if t["r"] is not None]
+    avg_win, avg_loss = (gp / len(wins) if wins else 0), (gl / len(losses) if losses else 0)
+    return {
+        "trades": len(ts), "win_rate": round(len(wins) / len(ts) * 100, 1),
+        "net_pnl": round(sum(net), 2), "gross_pnl": round(gross, 2), "fees": round(fees, 2),
+        "fees_pct_of_gross": round(fees / gross * 100, 1) if gross > 0 else None,
+        "avg_win": round(avg_win, 2), "avg_loss": round(-avg_loss, 2),
+        "payoff": round(avg_win / avg_loss, 2) if avg_loss else None,
+        "expectancy_r": round(sum(rs) / len(rs), 2) if rs else None,
+        "profit_factor": round(gp / gl, 2) if gl else None,
+        "avg_hold_min": round(sum(t["hold_min"] for t in ts) / len(ts), 1),
+        "max_drawdown": round(dd, 2),
+    }
+
+
+def by(ts, key):
+    groups = {}
+    for t in ts:
+        groups.setdefault(key(t), []).append(t)
+    out = {}
+    for k, g in sorted(groups.items()):
+        rs = [t["r"] for t in g if t["r"] is not None]
+        out[k] = {"n": len(g), "win_rate": round(sum(t["net"] > 0 for t in g) / len(g) * 100, 1),
+                  "net": round(sum(t["net"] for t in g), 2),
+                  "expectancy_r": round(sum(rs) / len(rs), 2) if rs else None}
+    return out
+
+
+def brief(t):
+    return {k: t[k] for k in ("symbol", "side", "setup", "opened_at", "net", "r", "reason", "note")}
+
+
+def half_hour(t):
+    return f"{t['opened_at'][11:13]}:{'00' if int(t['opened_at'][14:16]) < 30 else '30'}"
+
+
+def suggest(ts, s, groups):
+    if not ts:
+        return ["No closed trades in this period."]
+    out = []
+    if any(t["r"] is not None and t["r"] < -1.5 for t in ts):
+        out.append("A loss exceeded 1.5R: check stop fills (gaps) and that every stop was honoured.")
+    if s["fees_pct_of_gross"] and s["fees_pct_of_gross"] > 30:
+        out.append(f"Costs are {s['fees_pct_of_gross']}% of gross P&L: take fewer, higher-quality trades.")
+    if s["trades"] < MIN_SAMPLE:
+        out.append(f"Sample is {s['trades']} closed trades (need {MIN_SAMPLE}): log observations, do not change rules yet.")
+        return out
+    if s["expectancy_r"] is not None and s["expectancy_r"] <= 0:
+        out.append(f"Expectancy is {s['expectancy_r']}R over {s['trades']} trades: find the losing bucket below.")
+    for label, g in groups.items():
+        out += [f"{label} {k}: {v['expectancy_r']}R over {v['n']} trades. Restrict or drop it."
+                for k, v in g.items() if v["n"] >= MIN_SAMPLE and v["expectancy_r"] is not None and v["expectancy_r"] < 0]
+    return out or ["Within parameters. No rule changes."]
+
+
+def nifty_return(since):
+    """Nifty 50 close-to-close return since `since`, for context only (an intraday book is flat overnight)."""
+    rows = get_history("^NSEI", "3mo", "1d").get("data", [])
+    before = [r for r in rows if r["time"] < since.isoformat()]
+    if not rows:
+        return None
+    base = (before[-1] if before else rows[0])["close"]
+    return round((rows[-1]["close"] / base - 1) * 100, 2)
+
+
+def review(kind, days):
+    pf = load_json(PORTFOLIO_FILE, None)
+    if not pf:
+        return {"error": "No portfolio yet. Nothing to review."}
+    today = now_ist().date()
+    since = today - timedelta(days=days)
+    ts = [t for t in pf["trades"] if t["closed_at"][:10] >= since.isoformat()]
+    s = stats(ts)
+    groups = {"setup": by(ts, lambda t: t["setup"] or "none"), "side": by(ts, lambda t: t["side"]),
+              "segment": by(ts, lambda t: t["segment"]), "entry_time": by(ts, half_hour),
+              "sector": by(ts, lambda t: t["sector"] or "none")}
+    out = {"type": kind, "date": today.isoformat(), "from": since.isoformat(), **s,
+           **{f"by_{k}": v for k, v in groups.items()}, "by_exit_reason": by(ts, lambda t: t["reason"]),
+           "suggestions": suggest(ts, s, groups)}
+    if ts:
+        out["best_trade"], out["worst_trade"] = brief(max(ts, key=lambda t: t["net"])), brief(min(ts, key=lambda t: t["net"]))
+    if pf["day"]["date"] == today.isoformat():
+        out["halted_today"] = pf["day"]["halted"]
+    if kind == "monthly_review":
+        try:
+            out["nifty_return_pct"] = nifty_return(since)
+        except Exception:
+            out["nifty_return_pct"] = None
+    with lock():
+        log_decision(out)
+    return out
 
 
 def summary():
-    pf = load_json(PORTFOLIO_FILE)
+    pf = load_json(PORTFOLIO_FILE, None)
     if not pf:
-        return {"error": "No portfolio found. Initialize first."}
-
-    total_invested = sum(h["shares"] * h["avg_cost"] for h in pf["holdings"])
-    total_value = pf["cash"] + total_invested
-    total_return = total_value - pf["initial_capital"]
-    return_pct = (total_return / pf["initial_capital"]) * 100
-
-    sells = [t for t in pf["transactions"] if t["action"] == "SELL"]
-    wins = [t for t in sells if t.get("pnl", 0) > 0]
-    losses = [t for t in sells if t.get("pnl", 0) < 0]
-    breakeven = [t for t in sells if t.get("pnl", 0) == 0]
-
-    avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
-
-    return {
-        "portfolio_name": pf["portfolio_name"],
-        "initial_capital": pf["initial_capital"],
-        "current_value": round(total_value, 2),
-        "cash": round(pf["cash"], 2),
-        "invested": round(total_invested, 2),
-        "total_return": round(total_return, 2),
-        "return_pct": round(return_pct, 2),
-        "num_holdings": len(pf["holdings"]),
-        "closed_trades": len(sells),
-        "wins": len(wins),
-        "losses": len(losses),
-        "breakeven": len(breakeven),
-        "win_rate": round(len(wins) / len(sells) * 100, 1) if sells else 0,
-        "avg_win": round(avg_win, 2),
-        "avg_loss": round(avg_loss, 2),
-        "risk_reward_realized": round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
-        "total_realized_pnl": round(sum(t.get("pnl", 0) for t in sells), 2),
-        "largest_win": round(max((t.get("pnl", 0) for t in sells), default=0), 2),
-        "largest_loss": round(min((t.get("pnl", 0) for t in sells), default=0), 2),
-        "strategy_version": pf.get("strategy_version", 1),
-    }
-
-
-def weekly_review():
-    decisions = load_json(DECISIONS_FILE)
-    if not decisions:
-        return {"error": "No decisions logged yet."}
-
-    trades = [d for d in decisions if d.get("type") == "trade"]
-    sells = [d for d in trades if d.get("action") == "SELL"]
-    skips = [d for d in decisions if d.get("type") == "skip"]
-
-    review = {
-        "type": "weekly_review",
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "total_decisions": len(decisions),
-        "total_trades": len(trades),
-        "total_skips": len(skips),
-        "closed_trades": len(sells),
-    }
-
-    if sells:
-        wins = [s for s in sells if s.get("pnl", 0) > 0]
-        losses = [s for s in sells if s.get("pnl", 0) <= 0]
-
-        avg_win = sum(s["pnl"] for s in wins) / len(wins) if wins else 0
-        avg_loss = sum(s["pnl"] for s in losses) / len(losses) if losses else 0
-
-        review.update({
-            "win_rate": round(len(wins) / len(sells) * 100, 1),
-            "avg_win": round(avg_win, 2),
-            "avg_loss": round(avg_loss, 2),
-            "risk_reward_realized": round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
-            "top_winner": max(sells, key=lambda x: x.get("pnl", 0)),
-            "top_loser": min(sells, key=lambda x: x.get("pnl", 0)),
-        })
-
-        # Generate improvement suggestions
-        suggestions = []
-        if review["win_rate"] < 40:
-            suggestions.append("CRITICAL: Win rate below 40%. Tighten entry criteria. Review thesis quality.")
-        elif review["win_rate"] < 50:
-            suggestions.append("Win rate below 50%. Consider stricter filters or better timing.")
-
-        if review["risk_reward_realized"] < 1.5:
-            suggestions.append("Risk/reward below 1.5:1. Set wider targets or tighter stops.")
-        elif review["risk_reward_realized"] < 2:
-            suggestions.append("Risk/reward below 2:1. Room to improve — let winners run longer.")
-
-        if len(losses) > 0 and any(abs(l.get("pnl_pct", 0)) > 15 for l in losses):
-            suggestions.append("Some losses exceed 15%. Stop losses may be too wide or not being honored.")
-
-        if not suggestions:
-            suggestions.append("Strategy performing within parameters. Maintain current approach.")
-
-        review["suggestions"] = suggestions
-    else:
-        review["suggestions"] = ["No closed trades to review yet. Continue building positions."]
-
-    # Log the review
-    decisions.append(review)
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(DECISIONS_FILE, "w") as f:
-        json.dump(decisions, f, indent=2)
-
-    return review
+        return {"error": "No portfolio found. It is created by the first trade."}
+    return {"portfolio_name": pf["portfolio_name"], "initial_capital": pf["initial_capital"],
+            "equity": round(pf["cash"], 2), "return_pct": round((pf["cash"] / pf["initial_capital"] - 1) * 100, 2),
+            "open_positions": len(pf["positions"]), **stats(pf["trades"]),
+            "by_setup": by(pf["trades"], lambda t: t["setup"] or "none")}
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: performance.py <command>")
-        print("Commands: summary, weekly-review")
-        sys.exit(1)
-
-    cmd = sys.argv[1]
-
-    if cmd == "summary":
-        result = summary()
-    elif cmd == "weekly-review":
-        result = weekly_review()
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
-
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("cmd", choices=["summary", "daily-review", "weekly-review", "monthly-review"])
+    a = p.parse_args()
+    result = {"summary": summary,
+              "daily-review": lambda: review("daily_review", 0),
+              "weekly-review": lambda: review("weekly_review", 6),
+              "monthly-review": lambda: review("monthly_review", 29)}[a.cmd]()
     print(json.dumps(result, indent=2))
 
 
