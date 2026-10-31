@@ -122,6 +122,7 @@ hermes-anywhere/
 └── docs/
     ├── COSTS.md              # full cost comparison
     ├── MODEL_SELECTION.md    # which OpenRouter model to use
+    ├── NSE_LIVE_MCP.md       # NSE live data MCP used by the alpha-desk skill
     ├── SKILLS.md             # how to add your own skills
     └── TROUBLESHOOTING.md
 ```

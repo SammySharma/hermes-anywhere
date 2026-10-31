@@ -25,7 +25,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 OPEN, ENTRY_START, LAST_ENTRY, SQUARE_OFF, CLOSE = time(9, 15), time(9, 30), time(14, 30), time(15, 15), time(15, 30)
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("ALPHA_DESK_DATA") or os.path.join(SKILL_DIR, "data")
+# The paper book lives under the Hermes data folder, not in the skill folder, so updating or reinstalling the skill
+# never touches it (in the Docker image HERMES_HOME is /opt/data, the mounted hermes-data volume).
+HERMES_HOME = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+DATA_DIR = os.environ.get("ALPHA_DESK_DATA") or os.path.join(HERMES_HOME, "alpha-desk-data")
 
 NSE_MCP_URL = os.environ.get("NSE_MCP_URL", "https://mcp.nseindia.in/cmmkt/mcp")
 NSE_MAX_AGE_S = 360  # NSE says the feed runs 1-3 minutes behind; an older quote is stale

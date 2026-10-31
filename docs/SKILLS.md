@@ -38,6 +38,20 @@ scp -r skills/<name> user@<vm>:/opt/hermes-anywhere/hermes-data/skills/
 
 For a fresh deploy (no existing VM): the cloud-init bootstrap clones this repo to `/opt/hermes-anywhere`. Skills in the repo's `skills/` directory are not auto-copied into `hermes-data/skills/` because skill installation is per-deployment intentional. Either copy manually after first boot or extend the cloud-init `runcmd` block to do it.
 
+## Installing from GitHub
+
+Hermes can also install a skill straight from a GitHub folder:
+
+```bash
+hermes skills install <owner>/<repo>/tree/main/skills/<name>
+```
+
+Hermes scans community skills and blocks a CAUTION verdict.
+Read the findings before using `--force`, and prefer fixing them. Two rules of thumb when writing a skill:
+
+- Avoid raw `os.environ` access in scripts and tests. The scanner flags `os.environ[...]` and similar as a high-risk exfiltration pattern. `os.environ.get(...)` is accepted. In tests, set paths and clocks through module attributes instead.
+- Keep runtime data (books, logs, caches) outside the skill folder, for example under `$HERMES_HOME/<name>-data/`. The Hermes docs say `hermes skills update` skips a skill whose files changed since install, so data written inside the folder would block updates.
+
 ## Iterating on a skill
 
 Hermes' value comes from the agent **modifying** skills based on experience. Don't over-specify — give it room to learn. The Curator will:

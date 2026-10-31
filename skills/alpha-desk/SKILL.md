@@ -78,14 +78,7 @@ Changing any of them needs the user's approval.
 - Fallback and bars: Yahoo Finance (yfinance). NSE publishes no intraday bars, so the 15-minute bars behind the scan signals and the 1-minute bars that replay stop and target touches between polls come from Yahoo.
 - If nse-live is down, stale or has no quote, the script falls back to Yahoo on its own. The `src` field says which source answered, and `px_gap_pct` on scan candidates is the Yahoo versus nse-live price difference.
 - NSE's MCP server loses sessions about half the time (several instances, no sticky sessions), so the scripts retry. If you call the MCP tools natively from Hermes you may see "Session not found" errors. Just call again.
-- Optional, for ad-hoc questions in chat: add the server to `~/.hermes/config.yaml`, then run `/reload-mcp`. The tools appear as `mcp_nse_live_cm_get_stock_quote` and so on. The book itself always goes through the scripts.
-
-```yaml
-mcp_servers:
-  nse-live:
-    url: "https://mcp.nseindia.in/cmmkt/mcp"
-```
-
+- The scripts need no MCP setup. The user may register `nse-live` in Hermes for ad-hoc questions in chat (see `docs/NSE_LIVE_MCP.md` in the hermes-anywhere repo). The book itself always goes through the scripts. Never change Hermes settings yourself.
 - News and sentiment: web search, liberally, for sudden moves.
 
 ## Setups
@@ -161,17 +154,20 @@ End-of-day message (150 words max): P&L in rupees, trades and wins, equity, best
 | "Positions" / "Portfolio" | `portfolio.py value` |
 | "Long X" / "Short X" | Pre-trade checklist, `size`, propose, wait for confirmation |
 | "Exit X" / "Square off" | `price`, then `portfolio.py exit` immediately. The user's word is the approval |
-| "Watch X" | Add to `data/watchlist.json` (agent-managed, cleared each morning) |
+| "Watch X" | Add to `alpha-desk-data/watchlist.json` (agent-managed, cleared each morning) |
 | "Review" | `daily-review` or `weekly-review` |
 | "Performance" | `performance.py summary` |
 | "History" | `portfolio.py history` |
-| "Why did we enter/exit/skip X?" | Read `data/decisions_log.json` |
+| "Why did we enter/exit/skip X?" | Read `alpha-desk-data/decisions_log.json` |
 | "Principles" / "Strategy" | Show the files in `references/` |
 
 ## Scripts
 
 ```bash
-ADESK="${HERMES_HOME:-$HOME/.hermes}/skills/finance/alpha-desk/scripts"
+# ADESK is this skill's scripts/ folder, the one next to this SKILL.md. Usual place:
+ADESK="${HERMES_HOME:-$HOME/.hermes}/skills/alpha-desk/scripts"
+# If Hermes installed it under a category folder, find it with:
+#   find "${HERMES_HOME:-$HOME/.hermes}/skills" -name market_data.py -not -path "*/.hub/*"
 
 # Market data (symbols without .NS). Quotes and status are nse-live first, Yahoo as fallback
 python $ADESK/market_data.py status
@@ -206,7 +202,7 @@ Setting `ALPHA_DESK_SOURCE=yfinance` skips nse-live.
 
 ## Data files
 
-Created at runtime in `data/`. Do not edit `portfolio.json` by hand.
+Created at runtime in `alpha-desk-data/` under the Hermes data folder (`$HERMES_HOME`), outside the skill folder, so updating or reinstalling the skill never touches the book. Do not edit `portfolio.json` by hand.
 
 | File | Content |
 |------|---------|
