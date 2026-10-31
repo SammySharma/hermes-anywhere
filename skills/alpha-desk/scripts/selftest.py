@@ -9,7 +9,6 @@ import tempfile
 from datetime import datetime
 
 DATA = tempfile.mkdtemp()
-os.environ["ALPHA_DESK_DATA"] = DATA  # before the imports below read it
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd  # noqa: E402
@@ -17,6 +16,12 @@ import pandas as pd  # noqa: E402
 import market_data as md  # noqa: E402
 import performance as perf  # noqa: E402
 import portfolio as pf  # noqa: E402
+
+# Point every module at a throwaway folder so the checks never touch the real paper book
+md.DATA_DIR = pf.DATA_DIR = DATA
+pf.PORTFOLIO_FILE = perf.PORTFOLIO_FILE = os.path.join(DATA, "portfolio.json")
+pf.DECISIONS_FILE = os.path.join(DATA, "decisions_log.json")
+pf.LOCK_FILE = os.path.join(DATA, ".lock")
 
 
 def at(h, m):
@@ -217,8 +222,8 @@ def check_quote_fallback():
 
 
 def check_status():
-    real = md.nse_index, md._download
-    os.environ["ALPHA_DESK_NOW"] = "2026-10-30T11:00"
+    real = md.nse_index, md._download, md.now_ist
+    md.now_ist = lambda: at(11, 0)
     try:
         md._download = lambda *a, **k: {}
         md.nse_index = lambda name: {"stamp": at(10, 58)}
@@ -228,8 +233,7 @@ def check_status():
         s = md.status()
         assert s["state"] == "holiday" and s["error"] == "Market Holiday", s
     finally:
-        md.nse_index, md._download = real
-        del os.environ["ALPHA_DESK_NOW"]
+        md.nse_index, md._download, md.now_ist = real
 
 
 def check_segments():
