@@ -300,6 +300,7 @@ def monitor(now=None):
     with lock():
         pf = load_portfolio(now)
         d, exits, warn, last = pf["day"], [], [], {}
+        was_halted = d["halted"]
         syms = [p["symbol"] for p in pf["positions"]]
         quotes = {q["symbol"]: q for q in get_quotes(syms)} if syms else {}
         bars = get_bars(syms, "1d", "1m", now) if syms else {}
@@ -340,13 +341,54 @@ def monitor(now=None):
                     exits.append(_close(pf, pos, last[pos["symbol"]], "daily-loss-halt", None, now))
             day_pnl = pf["cash"] - d["start_equity"]
         save_json(PORTFOLIO_FILE, pf)
-        return {"time_ist": _ts(now), "exits": exits, "halted": d["halted"], "day_pnl": round(day_pnl, 2),
+        return {"time_ist": _ts(now), "exits": exits, "halted": d["halted"], "halt_triggered": d["halted"] and not was_halted,
+                "day_pnl": round(day_pnl, 2),
                 "open": [{"symbol": p["symbol"], "side": p["side"], "qty": p["qty"], "entry": p["entry"],
                           "ltp": round(last[p["symbol"]], 2) if p["symbol"] in last else None, "stop": p["stop"],
                           "target": p["target"],
                           "unrealized": round(unrealized(p), 2) if p["symbol"] in last else None}
                          for p in pf["positions"]],
                 "warnings": warn}
+
+
+def _throttled(text, now, minutes=10):
+    """True the first time `text` appears and again after `minutes`: a data outage would otherwise alert every minute."""
+    path = os.path.join(DATA_DIR, ".monitor_warn.json")
+    last = load_json(path, {})
+    if last.get("text") == text and now.timestamp() - last.get("t", 0) < minutes * 60:
+        return False
+    save_json(path, {"text": text, "t": now.timestamp()})
+    return True
+
+
+def _brief(res, now):
+    """Plain-text alert for a Hermes script-only cron job. Empty, so Hermes stays silent, unless a position closed or the
+    day halted. A missing price alone is repeated at most every 10 minutes."""
+    lines = [f"EXIT {t['symbol']} {t['side']} {t['reason']}: {t['net']:+.0f}" + (f" ({t['r']:+.2f}R)" if t["r"] is not None else "")
+             for t in res["exits"]]
+    if res["halt_triggered"]:
+        lines.append("DAILY LOSS LIMIT reached: positions closed, no new entries today")
+    if lines:
+        return "\n".join(lines + res["warnings"] + [f"Day P&L {res['day_pnl']:+.0f}"])
+    warnings = "\n".join(res["warnings"])
+    return warnings if warnings and _throttled(warnings, now) else ""
+
+
+def note(symbol, text, now=None):
+    """Attach a one-line post-mortem to the latest closed trade in `symbol`. The monitor closes stops and targets
+    itself, so `exit --note` only ever covers manual exits."""
+    now = now or now_ist()
+    symbol = norm(symbol)
+    with lock():
+        pf = load_portfolio(now)
+        trade = next((t for t in reversed(pf["trades"]) if t["symbol"] == symbol), None)
+        if not trade:
+            return {"error": f"No closed trade in {symbol}"}
+        trade["note"] = f"{trade['note']}; {text}" if trade["note"] else text
+        save_json(PORTFOLIO_FILE, pf)
+        log_decision({"type": "postmortem", "time": _ts(now), "symbol": symbol, "closed_at": trade["closed_at"],
+                      "reason": trade["reason"], "r": trade["r"], "note": text})
+        return {"status": "noted", "symbol": symbol, "closed_at": trade["closed_at"], "note": trade["note"]}
 
 
 # --- reports ---------------------------------------------------------------------------------------------------------
@@ -395,8 +437,10 @@ def history(n=20):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("show", "value", "monitor"):
+    for name in ("show", "value"):
         sub.add_parser(name)
+    sub.add_parser("monitor").add_argument("--brief", action="store_true",
+                                           help="print nothing unless a position closed or the day halted")
     for name in ("size", "long", "short"):
         s = sub.add_parser(name)
         s.add_argument("symbol")
@@ -422,8 +466,12 @@ def main():
     k.add_argument("symbol")
     k.add_argument("--reason", required=True)
     k.add_argument("--setup", default="")
+    n = sub.add_parser("note")
+    n.add_argument("symbol")
+    n.add_argument("text", help="one-line post-mortem for the latest closed trade in the symbol")
     sub.add_parser("history").add_argument("--n", type=int, default=20)
     a = p.parse_args()
+    brief = a.cmd == "monitor" and a.brief
 
     try:
         if a.cmd == "show":
@@ -432,6 +480,8 @@ def main():
             result = value()
         elif a.cmd == "monitor":
             result = monitor()
+        elif a.cmd == "note":
+            result = note(a.symbol, a.text)
         elif a.cmd == "size":
             result = size(a.symbol, a.side, a.price, a.stop, a.target, a.mult)
         elif a.cmd in ("long", "short"):
@@ -444,7 +494,16 @@ def main():
         else:
             result = history(a.n)
     except (ValueError, TimeoutError) as e:
+        if brief:  # a busy book just skips this minute; anything else must not fail silently
+            if isinstance(e, ValueError):
+                print(f"alpha-desk monitor error: {e}")
+            return
         result = {"error": str(e)}
+    if brief:
+        text = _brief(result, now_ist())
+        if text:
+            print(text)
+        return
     print(json.dumps(result, indent=2))
 
 
