@@ -125,7 +125,8 @@ def check_monitor():
             res = pf.monitor(now=when)
             # TCS is closed by the 15:15 square-off in the first pass and by the loss halt in the second
             assert sorted(e["reason"] for e in res["exits"]) == sorted(["stop", "square-off" if when.hour == 15 else "daily-loss-halt"]), res
-            assert res["halted"] and not res["open"] and res["day_pnl"] < -2000, res
+            assert res["halted"] and res["halt_triggered"] and not res["open"] and res["day_pnl"] < -2000, res
+            assert pf.monitor(now=when)["halted"] and not pf.monitor(now=when)["halt_triggered"]  # announced once, not every minute
             assert "Daily loss limit" in pf.open_position("LONG", "INFY", 500, 497.5, 507.5, now=at(14, 0))["error"]
 
         # nse-live is the primary price: with no bars, a live LTP through the stop closes at the market
@@ -244,6 +245,29 @@ def check_segments():
     large = pf.plan("LONG", 500, 497.5, 507.5, 100000, 0, 5, "LARGE")
     mid = pf.plan("LONG", 500, 497.5, 507.5, 100000, 0, 3, "MID")
     assert mid["net_rr"] < large["net_rr"] and mid["risk"] <= 1000 and not mid["problems"], (large, mid)
+
+
+def check_brief():
+    quiet = {"exits": [], "warnings": [], "halt_triggered": False, "day_pnl": 0}
+    assert pf._brief(quiet, at(11, 0)) == ""  # nothing happened: Hermes stays silent
+    stop = {"symbol": "TCS", "side": "LONG", "reason": "stop", "net": -992.3, "r": -1.0}
+    text = pf._brief({**quiet, "exits": [stop], "day_pnl": -992.3}, at(11, 0))
+    assert text.splitlines()[0] == "EXIT TCS LONG stop: -992 (-1.00R)" and text.endswith("Day P&L -992"), text
+    assert "DAILY LOSS LIMIT" in pf._brief({**quiet, "halt_triggered": True, "day_pnl": -2100}, at(11, 0))
+    warn = {**quiet, "warnings": ["No price for TCS; position unmanaged"]}  # a data outage alerts once, then every 10 minutes
+    assert pf._brief(warn, at(11, 0)) and not pf._brief(warn, at(11, 5)) and pf._brief(warn, at(11, 11))
+
+
+def check_note():
+    fresh_book("RELIANCE")
+    assert pf.exit_position("RELIANCE", 497, "stop", now=at(11, 0))["status"] == "closed"
+    assert pf.note("RELIANCE", "broke out on fading volume", now=at(11, 5))["status"] == "noted"
+    assert pf.load_portfolio(at(11, 5))["trades"][-1]["note"] == "broke out on fading volume"
+    pf.note("RELIANCE.NS", "second thought", now=at(11, 6))
+    assert pf.load_portfolio(at(11, 6))["trades"][-1]["note"].endswith("; second thought")
+    with open(pf.DECISIONS_FILE) as f:
+        assert json.load(f)[-1]["type"] == "postmortem"
+    assert "error" in pf.note("TCS", "no closed trade", now=at(11, 7))
 
 
 if __name__ == "__main__":

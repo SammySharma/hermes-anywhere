@@ -113,14 +113,14 @@ Proposal format:
 
 ```
 PROPOSAL: LONG SUNPHARMA @ 1790 (VWAP_RECLAIM, rvol 2.1, Nifty above VWAP)
-Stop 1778 (0.7%) | Target 1815 (1.4%) | Qty 80 | Risk ₹990 | Net R 1.6
+Stop 1778 (0.7%) | Target 1815 (1.4%) | Qty 69 | Risk ₹992 | Net R 1.6
 Why: [one line]. Valid 5 min.
 ```
 
 ## Schedule
 
 Create these Hermes cron jobs on first activation (UTC, weekdays unless noted).
-A normal day costs about 25 agent turns, which matters on a rate-limited model.
+A normal day costs about 25 agent turns, which matters on a rate-limited model. The monitor job below costs none.
 
 | Cron | IST | Job |
 |------|-----|-----|
@@ -129,9 +129,12 @@ A normal day costs about 25 agent turns, which matters on a rate-limited model.
 | `45 9 * * 1-5` | 15:15 | `portfolio.py monitor` (square-off). Report exits |
 | `15 10 * * 1-5` | 15:45 | `performance.py daily-review`, then the end-of-day message |
 | `30 4 * * 0` | Sunday 10:00 | `weekly-review`. On the first Sunday also `monthly-review` |
-| `*/5 4-9 * * 1-5` | Optional | `portfolio.py monitor` only. Message the user only on an exit, halt or warning |
+| `* 4-9 * * 1-5` | 09:30 to 15:29, every minute | Script-only job `alpha-desk-monitor.sh`, which runs `portfolio.py monitor --brief`. No agent turn, and silent unless a position closes, the day halts or a price is missing |
 
+The user sets up the script-only monitor once (`docs/ALPHA_DESK_CRON.md` in the hermes-anywhere repo). Create the other jobs yourself.
+Without it, open positions are checked only at scan turns and at 15:15, so nothing watches between 14:30 and 15:15.
 Paper fills are computed from 1-minute bars, so a slower monitor delays notifications but not fill prices.
+With the monitor job you hear about an exit within about a minute, plus NSE's own 1 to 3 minute feed delay.
 
 Pre-session brief (plain text, 120 words max):
 
@@ -185,10 +188,12 @@ python $ADESK/portfolio.py long SUNPHARMA 1790 --stop 1778 --target 1815 --qty 8
 python $ADESK/portfolio.py short INDIGO 4814 --stop 4838 --target 4760 --setup VWAP_REJECT
 python $ADESK/portfolio.py exit SUNPHARMA 1805 --reason manual --note "one line post-mortem"
 python $ADESK/portfolio.py exit SUNPHARMA 1805 --reason partial --qty 40
+python $ADESK/portfolio.py note SUNPHARMA "fake breakout, volume faded"   # post-mortem on the latest closed trade
 python $ADESK/portfolio.py skip TMCV --reason "ORB range 2% is too wide for a 1% stop" --setup ORB_LONG
 python $ADESK/portfolio.py show        # rules, margin, open positions
 python $ADESK/portfolio.py value       # equity marked to live prices
 python $ADESK/portfolio.py monitor     # stop, target, breakeven, square-off, loss halt
+python $ADESK/portfolio.py monitor --brief   # same, but prints nothing unless something happened (for the cron job)
 python $ADESK/portfolio.py history --n 20
 
 # Reviews and checks
@@ -220,7 +225,7 @@ If a v1 swing `portfolio.json` is present, the scripts report an error. Rename i
 
 ### Always on
 
-- On every stop-out, pass `--note` with a one-line post-mortem (for example "fake breakout, volume faded").
+- After every stop-out, add a one-line post-mortem with `portfolio.py note SYMBOL "..."` (for example "fake breakout, volume faded"). The monitor closes stops and targets itself, so `exit --note` only covers manual exits.
 - On every winner, note in one line why it worked.
 - Watch which setups, segments and time slots lose. The reviews break results down by setup, side, segment, entry time, sector and exit reason. Judge whether the midcap slots earn their higher costs.
 
@@ -269,7 +274,7 @@ Hermes NEVER:
 
 1. Run `selftest.py`. It must print `selftest OK`.
 2. Run `market_data.py universe` (expect 496 names: 100 `LARGE`, 149 `MID`, 247 `SMALL`) and, during market hours, `market_data.py price RELIANCE` (expect `src: nse-live`).
-3. Create the cron jobs in the Schedule section.
+3. Create the cron jobs in the Schedule section, and ask the user to set up the script-only monitor.
 4. Ask the user which broker's MIS multipliers apply, and any sectors or stocks to avoid.
 5. Run the first `screen` (about a minute) and present the first brief.
 

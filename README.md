@@ -120,6 +120,7 @@ hermes-anywhere/
 │   └── alpha-desk/           # example skill - NSE intraday (MIS) paper-trading desk
 ├── scripts/
 └── docs/
+    ├── ALPHA_DESK_CRON.md    # cron jobs the alpha-desk skill needs
     ├── COSTS.md              # full cost comparison
     ├── MODEL_SELECTION.md    # which OpenRouter model to use
     ├── NSE_LIVE_MCP.md       # NSE live data MCP used by the alpha-desk skill
