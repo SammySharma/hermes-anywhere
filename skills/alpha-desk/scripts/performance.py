@@ -8,7 +8,9 @@ from datetime import timedelta
 from market_data import get_history, now_ist
 from portfolio import PORTFOLIO_FILE, load_json, lock, log_decision
 
-MIN_SAMPLE = 20  # closed trades in a bucket before a rule change is justified
+# Closed trades in a bucket before its result means anything. One R of noise per trade puts the standard error of a
+# 20-trade average near 0.25R, larger than any edge this desk could have, so 20 trades cannot tell a rule from luck.
+MIN_SAMPLE = 100
 
 
 def stats(ts):
@@ -68,7 +70,8 @@ def suggest(ts, s, groups):
     if s["fees_pct_of_gross"] and s["fees_pct_of_gross"] > 30:
         out.append(f"Costs are {s['fees_pct_of_gross']}% of gross P&L: take fewer, higher-quality trades.")
     if s["trades"] < MIN_SAMPLE:
-        out.append(f"Sample is {s['trades']} closed trades (need {MIN_SAMPLE}): log observations, do not change rules yet.")
+        out.append(f"Sample is {s['trades']} closed trades (need {MIN_SAMPLE}): log observations, do not change rules yet. "
+                   "Test any idea in backtest.py first.")
         return out
     if s["expectancy_r"] is not None and s["expectancy_r"] <= 0:
         out.append(f"Expectancy is {s['expectancy_r']}R over {s['trades']} trades: find the losing bucket below.")

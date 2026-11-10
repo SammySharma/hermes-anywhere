@@ -21,6 +21,8 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta, timezone
 
+import strategy
+
 IST = timezone(timedelta(hours=5, minutes=30))
 OPEN, ENTRY_START, LAST_ENTRY, SQUARE_OFF, CLOSE = time(9, 15), time(9, 30), time(14, 30), time(15, 15), time(15, 30)
 
@@ -38,8 +40,10 @@ LISTS = {"nifty500": 400, "nifty100": 90, "niftymidcap150": 140}  # index list -
 # Shortlist filters (daily data, last 20 sessions) and per-segment slots, so midcaps are not crowded out by large caps.
 # Tune from the weekly review.
 MIN_PRICE, MIN_TURNOVER_CR, MIN_ATR_PCT = 50, 50, 1.0
-SHORTLIST_CAPS = {"LARGE": 80, "MID": 100, "SMALL": 30}
-MIN_RVOL = 1.2
+# Smallcaps get no slots: about 0.3% of round-trip cost is a third of a 1% stop. Re-open them only if backtest.py
+# shows the SMALL segment paying for itself.
+SHORTLIST_CAPS = {"LARGE": 80, "MID": 100, "SMALL": 0}
+FNO_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
 STALE_BAR_MIN = 18  # a live 15m bar older than this means the Yahoo feed is lagging
 NIFTY_ETF, MID_ETF = "NIFTYBEES", "MID150BEES"  # indices have no volume, so their ETFs supply the VWAP side
 REF = {"LARGE": "nifty", "MID": "midcap150", "SMALL": "midcap150"}  # which backdrop each segment is judged against
@@ -347,6 +351,35 @@ def load_universe(refresh=False):
             for r in _constituents("nifty500", refresh) if r["Series"] == "EQ"}
 
 
+def fno_symbols(refresh=False):
+    """Nifty 500 names with stock futures, from NSE's lot-size file (cached weekly), or None if it is unavailable."""
+    cache = os.path.join(DATA_DIR, "fno_mktlots.csv")
+    if refresh and (not os.path.exists(cache) or _time.time() - os.path.getmtime(cache) > 7 * 86400):
+        try:
+            req = urllib.request.Request(FNO_URL, headers={"User-Agent": "Mozilla/5.0"})
+            raw = urllib.request.urlopen(req, timeout=20).read()
+            if raw.count(b"\n") < 100:
+                raise ValueError("unexpected NSE response")
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(cache, "wb") as f:
+                f.write(raw)
+        except Exception:
+            pass
+    if not os.path.exists(cache):
+        return None
+    uni = load_universe()
+    with open(cache, newline="", encoding="utf-8-sig", errors="replace") as f:
+        found = {r[1].strip().upper() for r in csv.reader(f) if len(r) > 1} & set(uni)
+    return found if len(found) >= 100 else None
+
+
+def shortable(symbol):
+    """Shorts only in F&O stocks: they have no fixed price band, so a short cannot be locked in at an upper circuit and
+    sent to auction. Without NSE's F&O list the Nifty 100 stands in for it."""
+    fno, sym = fno_symbols(), _sym(symbol)
+    return sym in fno if fno else segment_of(sym) == "LARGE"
+
+
 def segment_of(symbol):
     """LARGE / MID / SMALL. A stock outside the Nifty 500 is treated as SMALL, the most expensive to trade."""
     return load_universe().get(_sym(symbol), {}).get("segment", "SMALL")
@@ -392,6 +425,7 @@ def screen():
 
     now = now_ist()
     uni = load_universe(refresh=True)
+    fno_symbols(refresh=True)
     daily = _download([s + ".NS" for s in uni], "2mo", "1d")
     if len(daily) < 0.8 * len(uni):
         return {"error": f"Daily data incomplete ({len(daily)}/{len(uni)} symbols). Retry in a few minutes."}
@@ -450,86 +484,84 @@ def regime():
     return {"nifty": side(etf[NIFTY_ETF], nifty), "midcap150": side(etf[MID_ETF], mid), "india_vix": vix}
 
 
-def _metrics(d, prev_close, now):
-    """Setup metrics for the current session in a 15m frame, using completed bars only. None if not tradable yet."""
-    days = [g for _, g in d.groupby(d.index.date)]
-    cur, prior = days[-1], days[:-1]
-    if cur.index[-1].date() != now.date():
-        return None
-    done = cur[cur.index + timedelta(minutes=15) <= now]
-    if done.empty:
-        return None
-    n = len(done)
-    vw = _vwap(cur)
-    ltp, vwap = float(cur["Close"].iloc[-1]), float(vw.iloc[-1])
-    c, v = done["Close"], vw.loc[done.index]
-    orb_hi, orb_lo = float(cur["High"].iloc[0]), float(cur["Low"].iloc[0])
-    sig = []
-    if n >= 2:  # signals fire on the latest completed bar only, so every candidate is fresh
-        if c.iloc[-1] > orb_hi >= c.iloc[-2] and c.iloc[-1] > v.iloc[-1]:
-            sig.append("ORB_LONG")
-        if c.iloc[-1] < orb_lo <= c.iloc[-2] and c.iloc[-1] < v.iloc[-1]:
-            sig.append("ORB_SHORT")
-        if c.iloc[-2] < v.iloc[-2] and c.iloc[-1] > v.iloc[-1]:
-            sig.append("VWAP_RECLAIM")
-        if c.iloc[-2] > v.iloc[-2] and c.iloc[-1] < v.iloc[-1]:
-            sig.append("VWAP_REJECT")
-    hist = [g["Volume"].iloc[:n].sum() for g in prior[-4:] if len(g) >= n]
-    base = sum(hist) / len(hist) if hist else 0
-    return {
-        "ltp": _r(ltp), "chg_pct": _r((ltp / prev_close - 1) * 100),
-        "gap_pct": _r((float(cur["Open"].iloc[0]) / prev_close - 1) * 100),
-        "vwap": _r(vwap), "vwap_dist_pct": _r((ltp / vwap - 1) * 100),
-        "orb_high": _r(orb_hi), "orb_low": _r(orb_lo), "orb_range_pct": _r((orb_hi - orb_lo) / orb_lo * 100),
-        "rvol": _r(done["Volume"].sum() / base) if base else None,
-        "signals": sig,
-    }
+def _candidates(frames, meta, now, p=None):
+    """The day's ORB orders from 15-minute frames ({symbol: bars}) and the shortlist rows, ranked by opening-range
+    relative volume. Pure, so the selftest and the backtester exercise the same rules as the live scan."""
+    p = p or strategy.PARAMS
+    end, out = strategy.or_end(p), []
+    if now.time() < end:
+        return out
+    for sym, m in meta.items():
+        d = frames.get(sym)
+        if d is None or d.empty:
+            continue
+        days = [g for _, g in d.groupby(d.index.date)]
+        cur = days[-1]
+        if cur.index[-1].date() != now.date() or cur.index[0].time() != OPEN:
+            continue
+        orb, vols = cur[cur.index.time < end], []
+        for g in days[:-1]:
+            w = g[g.index.time < end]
+            if not w.empty and w.index[0].time() == OPEN:
+                vols.append(float(w["Volume"].sum()))
+        plan, _ = strategy.opening_plan(float(orb["Open"].iloc[0]), float(orb["High"].max()), float(orb["Low"].min()),
+                                        float(orb["Close"].iloc[-1]), float(orb["Volume"].sum()), vols,
+                                        m["atr_pct"] / 100 * m["prev_close"], p)
+        if not plan:
+            continue
+        after = cur[cur.index.time >= end]
+        out.append({"symbol": sym, "segment": m["segment"], "industry": m["industry"], **plan,
+                    "ltp": _r(cur["Close"].iloc[-1]), "atr_pct": m["atr_pct"], "turnover_cr": m["turnover_cr"],
+                    "state": _state(plan, after["High"].max() if not after.empty else None,
+                                    after["Low"].min() if not after.empty else None, float(cur["Close"].iloc[-1]), p)})
+    return sorted(out, key=lambda c: -c["or_rvol"])
 
 
-def scan(top=15, min_rvol=MIN_RVOL):
-    """Fresh ORB / VWAP signals on the shortlist from 15m bars, ranked by relative volume. The leaders are re-priced
-    from nse-live and judged against the backdrop of their own segment (Nifty 50 for large caps, Midcap 150 below)."""
+def _state(plan, hi, lo, ltp, p):
+    """waiting: not triggered yet. triggered: traded through the trigger but still near it. extended: do not chase."""
+    sgn = 1 if plan["side"] == "LONG" else -1
+    if (ltp - plan["trigger"]) * sgn > p["extended_r"] * abs(plan["trigger"] - plan["stop"]):
+        return "extended"
+    ext = hi if sgn > 0 else lo
+    return "triggered" if ext is not None and (ext - plan["trigger"]) * sgn >= 0 else "waiting"
+
+
+def scan(top=None):
+    """Today's opening-range orders on the shortlist: side, trigger and stop computed in strategy.py, the leaders
+    re-priced from nse-live. Run it once the 09:15 candle is complete; the levels do not change after that."""
+    p = strategy.PARAMS
     st = status()
     if st["state"] != "open":
         return {"error": st.get("error") or f"Market not open ({st['state']})", **st}
+    now = now_ist()
+    if now.time() < strategy.or_end(p):
+        return {"error": f"The opening range completes at {strategy.or_end(p).strftime('%H:%M')} IST."}
     sl = shortlist()
     if "error" in sl:
         return sl
-    now = now_ist()
     meta = {r["symbol"]: r for r in sl["symbols"]}
-    frames = {y: d[d.index <= now] for y, d in _download([s + ".NS" for s in meta], "5d", "15m").items()}
+    frames = {y[:-3]: d[d.index <= now] for y, d in _download([s + ".NS" for s in meta], "1mo", "15m").items()}
     last = max((d.index[-1] for d in frames.values() if not d.empty), default=None)
-    if last is None:
-        return {"error": "No intraday bars; do not trade."}
+    if last is None or last.date() != now.date():
+        return {"error": "No intraday bars for today yet; retry in two minutes. Do not trade without them."}
     age = (now - last).total_seconds() / 60
-    if age > STALE_BAR_MIN:
+    if age > STALE_BAR_MIN + 15:
         return {"error": f"Stale bars: last bar {last.strftime('%H:%M')} IST, {age:.0f} min old."}
 
     reg = regime()
-    cands = []
-    for sym, m in meta.items():
-        d = frames.get(sym + ".NS")
-        x = _metrics(d, m["prev_close"], now) if d is not None and not d.empty else None
-        if not x or not x["signals"] or (x["rvol"] or 0) < min_rvol:
-            continue
-        side = reg[REF[m["segment"]]]["vs_vwap"]
-        aligned = None if side is None else any(s in ("ORB_LONG", "VWAP_RECLAIM") for s in x["signals"]) == (side == "above")
-        cands.append({"symbol": sym, "segment": m["segment"], "industry": m["industry"], **x,
-                      "atr_pct": m["atr_pct"], "turnover_cr": m["turnover_cr"], "aligned": aligned})
-    cands.sort(key=lambda c: (0 if c["aligned"] else 2 if c["aligned"] is False else 1, -c["rvol"]))
-    cands = cands[:top]
-
+    cands = _candidates(frames, meta, now, p)[:top or p["top"]]
     for c, q in zip(cands, get_quotes([c["symbol"] for c in cands])):
         if q.get("ltp") and q.get("live"):
-            c["px_gap_pct"] = _r(abs(q["ltp"] / c["ltp"] - 1) * 100)
-            c.update(ltp=q["ltp"], chg_pct=q["chg_pct"], vwap=q["vwap"] or c["vwap"], src=q["src"])
-            c["vwap_dist_pct"] = _r((c["ltp"] / c["vwap"] - 1) * 100)
+            c.update(ltp=q["ltp"], src=q["src"])
+            # the trigger lies outside the opening range, so a day high or low beyond it means it has traded
+            c["state"] = _state(c, q.get("high") or None, q.get("low") or None, q["ltp"], p)
         else:
             c["src"] = "yfinance"
-        bench = reg[REF[c["segment"]]]["chg_pct"]
-        c["rs_vs_ref"] = _r(c["chg_pct"] - bench) if bench is not None and c["chg_pct"] is not None else None
+        side = reg[REF[c["segment"]]]["vs_vwap"]
+        c["with_index"] = None if side is None else (c["side"] == "LONG") == (side == "above")
+        c["shortable"] = c["side"] == "LONG" or shortable(c["symbol"])
     return {"time_ist": now.strftime("%Y-%m-%d %H:%M"), "last_bar": last.strftime("%H:%M"), "regime": reg,
-            "shortlist": len(meta), "candidates": cands}
+            "shortlist": len(meta), "entry_until": p["entry_until"], "candidates": cands}
 
 
 def get_history(symbol, period="5d", interval="15m"):
@@ -549,9 +581,8 @@ def main():
     sub.add_parser("universe", help="Nifty 500 EQ constituents by segment and industry")
     sub.add_parser("screen", help="rebuild the liquid shortlist now")
     sub.add_parser("regime", help="Nifty 50 and Midcap 150 backdrop plus India VIX")
-    s = sub.add_parser("scan", help="fresh ORB / VWAP signals on the shortlist")
-    s.add_argument("--top", type=int, default=15)
-    s.add_argument("--min-rvol", type=float, default=MIN_RVOL)
+    s = sub.add_parser("scan", help="today's opening-range orders on the shortlist")
+    s.add_argument("--top", type=int)
     sub.add_parser("price").add_argument("symbol")
     sub.add_parser("multi").add_argument("symbols", help="comma separated")
     h = sub.add_parser("history")
@@ -572,7 +603,7 @@ def main():
     elif a.cmd == "regime":
         result = regime()
     elif a.cmd == "scan":
-        result = scan(a.top, a.min_rvol)
+        result = scan(a.top)
     elif a.cmd == "price":
         result = get_quotes([a.symbol])[0]
     elif a.cmd == "multi":
