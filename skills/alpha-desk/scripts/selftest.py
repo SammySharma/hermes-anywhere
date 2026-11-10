@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline self-check of fees, sizing rules, exit replay, book accounting and the setup scan. Run: python selftest.py"""
+"""Offline self-check of fees, sizing rules, the ORB plan, armed orders, exit replay, book accounting and the
+backtester. Run: python selftest.py"""
 
 import json
 import os
@@ -13,15 +14,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd  # noqa: E402
 
+import backtest as bt  # noqa: E402
 import market_data as md  # noqa: E402
 import performance as perf  # noqa: E402
 import portfolio as pf  # noqa: E402
+import strategy  # noqa: E402
 
 # Point every module at a throwaway folder so the checks never touch the real paper book
 md.DATA_DIR = pf.DATA_DIR = DATA
 pf.PORTFOLIO_FILE = perf.PORTFOLIO_FILE = os.path.join(DATA, "portfolio.json")
 pf.DECISIONS_FILE = os.path.join(DATA, "decisions_log.json")
 pf.LOCK_FILE = os.path.join(DATA, ".lock")
+pf.NEWS_FILE = os.path.join(DATA, "news_scores.json")
+
+
+md.fno_symbols = lambda refresh=False: None  # no F&O file offline: the Nifty 100 stands in for it
+L = dict(price=500, stop=494, target=512)  # a 1.2% stop: wide enough that costs stay under a quarter of the risk
 
 
 def at(h, m):
@@ -39,83 +47,228 @@ def check_costs():
 
 
 def check_rules():
-    p = pf.plan("LONG", 500, 497.5, 507.5, 100000, 0, 5)
-    assert not p["problems"] and p["risk"] <= 1000 and p["notional"] <= 100000 * 5 / 3 and p["net_rr"] >= 1.5, p
-    assert not pf.plan("SHORT", 500, 502.5, 492.5, 100000, 0, 5)["problems"]
-    assert "Stop is" in pf.plan("LONG", 500, 490, 520, 100000, 0, 5)["problems"][0]  # 2% stop
-    assert "Stop is" in pf.plan("LONG", 500, 499, 510, 100000, 0, 5)["problems"][0]  # 0.2% stop
-    assert any("reward:risk" in x for x in pf.plan("LONG", 500, 497.5, 502, 100000, 0, 5)["problems"])
+    p = pf.plan("LONG", 500, 494, 512, 100000, 0, 5)
+    assert not p["problems"] and p["risk"] <= 500 and p["cost_r"] <= pf.MAX_COST_R and p["net_rr"] >= 1.5, p
+    assert not pf.plan("SHORT", 500, 506, 488, 100000, 0, 5)["problems"]
+    free = pf.plan("LONG", 500, 494, None, 100000, 0, 5)  # no target: the exit is the stop or the square-off
+    assert not free["problems"] and "net_rr" not in free, free
+    assert "maximum is" in pf.plan("LONG", 500, 480, None, 100000, 0, 5)["problems"][0]  # 4% stop
+    assert any("too tight" in x for x in pf.plan("LONG", 500, 499, None, 100000, 0, 5)["problems"])  # costs eat a 0.2% stop
+    assert any("reward:risk" in x for x in pf.plan("LONG", 500, 494, 503, 100000, 0, 5)["problems"])
     assert "must be below" in pf.plan("LONG", 500, 505, 510, 100000, 0, 5)["problems"][0]
-    assert pf.plan("LONG", 500, 497.5, 507.5, 100000, 100000, 5)["problems"]  # no free margin
+    assert pf.plan("LONG", 500, 494, None, 100000, 100000, 5)["problems"]  # no free margin
 
 
 def check_walk():
-    long_ = {"side": "LONG", "entry": 500.15, "stop": 497.5, "stop0": 497.5, "target": 507.5}
-    assert pf._walk(long_, bars([(500, 500.5, 499, 500), (498, 498, 497, 497.4)]))[:2] == ("stop", 497.5)
-    assert pf._walk(long_, bars([(496, 497, 495, 496)]))[:2] == ("stop", 496)  # gap fills at the open
-    assert pf._walk(long_, bars([(500, 508, 500, 507)]))[:2] == ("target", 507.5)
-    assert pf._walk(long_, bars([(500, 508, 497, 500)]))[0] == "stop"  # both touched: stop wins
-    r = pf._walk(long_, bars([(500, 503, 500, 502), (501, 501, 500.1, 500.5)]))  # +1R moves the stop to cost
-    assert r[:2] == ("trail-stop", 500.15), r
-    short = {"side": "SHORT", "entry": 499.85, "stop": 502.5, "stop0": 502.5, "target": 492.5}
-    assert pf._walk(short, bars([(500, 503, 499, 500)]))[:2] == ("stop", 502.5)
-    assert pf._walk(short, bars([(500, 500, 492, 493)]))[:2] == ("target", 492.5)
+    long_ = {"side": "LONG", "entry": 500.25, "stop": 494, "stop0": 494, "target": 512}
+    assert pf._walk(long_, bars([(500, 500.5, 499, 500), (495, 495, 493, 493.4)]))[:2] == ("stop", 494)
+    assert pf._walk(long_, bars([(492, 493, 491, 492)]))[:2] == ("stop", 492)  # gap fills at the open
+    assert pf._walk(long_, bars([(500, 513, 500, 512)]))[:2] == ("target", 512)
+    assert pf._walk(long_, bars([(500, 513, 493, 500)]))[0] == "stop"  # both touched: stop wins
+    r = pf._walk(long_, bars([(500, 508, 500, 507), (501, 501, 500.1, 500.5)]))  # +1R and back: the stop stays put
+    assert r[0] is None and r[3] == 494, r
+    free = {**long_, "target": None}
+    assert pf._walk(free, bars([(500, 560, 500, 555)]))[0] is None  # no target: only the stop or the square-off exits
+    short = {"side": "SHORT", "entry": 499.75, "stop": 506, "stop0": 506, "target": 488}
+    assert pf._walk(short, bars([(500, 507, 499, 500)]))[:2] == ("stop", 506)
+    assert pf._walk(short, bars([(500, 500, 487, 489)]))[:2] == ("target", 488)
 
 
 def check_book():
-    opened = pf.open_position("LONG", "ABC", 500, 497.5, 507.5, setup="ORB_LONG", now=at(10, 15))
-    assert opened["status"] == "opened" and opened["risk"] <= 1000, opened
-    assert "already open" in pf.open_position("LONG", "ABC", 500, 497.5, 507.5, now=at(10, 20))["error"]
-    assert "entry window" in pf.open_position("LONG", "XYZ", 500, 497.5, 507.5, now=at(9, 20))["error"]
-    assert "entry window" in pf.open_position("LONG", "XYZ", 500, 497.5, 507.5, now=at(14, 45))["error"]
-    assert "exceeds" in pf.open_position("LONG", "XYZ", 500, 497.5, 507.5, qty=10000, now=at(10, 20))["error"]
+    opened = pf.open_position("LONG", "RELIANCE", **L, setup="ORB_PLAY", now=at(10, 15))
+    assert opened["status"] == "opened" and opened["risk"] <= 500, opened
+    assert "already open" in pf.open_position("LONG", "RELIANCE", **L, now=at(10, 20))["error"]
+    assert "entry window" in pf.open_position("LONG", "TCS", **L, now=at(9, 20))["error"]
+    assert "entry window" in pf.open_position("LONG", "TCS", **L, now=at(14, 45))["error"]
+    assert "exceeds" in pf.open_position("LONG", "TCS", **L, qty=10000, now=at(10, 20))["error"]
+    assert "not in F&O" in pf.open_position("SHORT", "NOTASTOCK", 500, 506, 488, now=at(10, 20))["error"]
 
-    closed = pf.exit_position("ABC", 507.5, "target", now=at(11, 0))
+    closed = pf.exit_position("RELIANCE", 512, "target", now=at(11, 0))
     book = pf.load_portfolio(at(11, 0))
     assert abs(book["cash"] - (pf.CAPITAL + closed["net"])) < 0.01 and closed["net"] > 0 and closed["r"] > 1.5, closed
+    assert "already traded today" in pf.open_position("LONG", "RELIANCE", **L, now=at(11, 2))["error"]
 
-    opened = pf.open_position("SHORT", "DEF", 500, 502.5, 492.5, now=at(11, 5))
+    opened = pf.open_position("SHORT", "INFY", 500, 506, 488, now=at(11, 5))
     half = opened["qty"] // 2
-    part = pf.exit_position("DEF", 495, "partial", qty=half, now=at(11, 30))
+    part = pf.exit_position("INFY", 495, "partial", qty=half, now=at(11, 30))
     book = pf.load_portfolio(at(11, 30))
     assert part["qty"] == half and book["positions"][0]["qty"] == opened["qty"] - half and part["net"] > 0, part
-    pf.exit_position("DEF", 502.5, "stop", now=at(11, 40))
+    pf.exit_position("INFY", 506, "stop", now=at(11, 40))
     assert len(book["trades"]) == 2 and not pf.load_portfolio(at(11, 40))["positions"]
 
     book = pf.load_portfolio(at(12, 0))
     book["cash"] = pf.CAPITAL * (1 - pf.DAILY_LOSS_PCT / 100) - 1
     pf.save_json(pf.PORTFOLIO_FILE, book)
-    assert "Daily loss limit" in pf.open_position("LONG", "GHI", 500, 497.5, 507.5, now=at(12, 0))["error"]
-
-
-def check_scan():
-    prior = pd.date_range("2026-10-29 09:15", periods=25, freq="15min", tz=md.IST)
-    today = pd.date_range("2026-10-30 09:15", periods=3, freq="15min", tz=md.IST)
-    rows = [(100, 101, 99.5, 100.5, 500)] * 25 + [(100, 101, 99.5, 100.5, 1000), (100.5, 101, 100.2, 100.8, 800),
-                                                  (100.8, 102, 100.8, 101.8, 2000)]
-    df = pd.DataFrame(rows, index=prior.append(today), columns=["Open", "High", "Low", "Close", "Volume"])
-    m = md._metrics(df, 100.0, at(10, 0))  # bars up to 09:45 are complete
-    assert "ORB_LONG" in m["signals"] and m["rvol"] > 2, m
-    assert md._metrics(df, 100.0, at(9, 30))["signals"] == []  # only the opening-range bar exists
+    assert "Daily loss limit" in pf.open_position("LONG", "TCS", **L, now=at(12, 0))["error"]
 
 
 def check_stats():
     assert perf.stats([]) == {"trades": 0}
     s = perf.stats(pf.load_portfolio(at(12, 0))["trades"])
-    assert s["trades"] == 3 and s["profit_factor"] > 0, s  # ABC target, DEF partial, DEF stop
+    assert s["trades"] == 3 and s["profit_factor"] > 0, s  # RELIANCE target, INFY partial, INFY stop
     assert "do not change rules" in perf.suggest([{"r": 1}], {"trades": 1, "fees_pct_of_gross": None}, {})[0]
+
+
+def check_scan():
+    prior = pd.date_range("2026-10-20 09:15", periods=8, freq="D", tz=md.IST)
+    rows, idx = [], []
+    for d in prior:  # eight quiet sessions: 1000 shares in the opening range
+        idx += [d, d + pd.Timedelta(minutes=15)]
+        rows += [(100, 100.4, 99.8, 100.1, 1000), (100.1, 100.5, 100, 100.2, 800)]
+    today = pd.date_range("2026-10-30 09:15", periods=2, freq="15min", tz=md.IST)
+    up = pd.DataFrame(rows + [(100, 100.8, 99.9, 100.7, 5000), (100.7, 100.9, 100.5, 100.8, 900)],
+                      index=pd.DatetimeIndex(idx).append(today), columns=["Open", "High", "Low", "Close", "Volume"])
+    quiet = up.copy()
+    quiet.iloc[-2, quiet.columns.get_loc("Volume")] = 1100  # same candle on ordinary volume: not in play
+    meta = {k: {"segment": "LARGE", "industry": "X", "atr_pct": 2.0, "prev_close": 100.0, "turnover_cr": 500} for k in ("UP", "QUIET")}
+    c = md._candidates({"UP": up, "QUIET": quiet}, meta, at(9, 46))
+    assert [x["symbol"] for x in c] == ["UP"] and c[0]["side"] == "LONG" and c[0]["or_rvol"] == 5.0, c
+    assert c[0]["trigger"] == 100.85 and c[0]["stop"] == 100.05 and c[0]["state"] == "triggered", c  # stop is 0.4 of a Rs 2 ATR
+    assert md._candidates({"UP": up}, meta, at(9, 20)) == []  # the opening range is not complete yet
+
+
+def check_strategy():
+    plan, why = strategy.opening_plan(100, 100.8, 99.9, 99.95, 5000, [1000] * 8, 2.0)
+    assert plan["side"] == "SHORT" and plan["trigger"] == 99.85 and plan["stop"] == 100.65, plan  # a red opening candle
+    assert strategy.opening_plan(100, 100.8, 99.9, 100.7, 5000, [1000] * 3, 2.0)[1] == "too little volume history"
+    assert "ATR" in strategy.opening_plan(100, 103, 99.9, 102.5, 5000, [1000] * 8, 2.0)[1]  # the move is already spent
+
+
+def check_sleeves():
+    assert strategy.day_mode(80, 20) == ("trend", 0.6) and strategy.day_mode(55, 45)[0] == "range"
+    assert strategy.orb_risk_mult("trend") == 1.0 and strategy.orb_risk_mult("range") == 0.5
+    in_play = {"side": "LONG", "or_rvol": 2.4, "setup": "ORB_PLAY"}
+    thin = {"side": "LONG", "or_rvol": 1.6, "setup": "ORB_PLAY"}
+    assert strategy.news_ok(in_play, None) == (True, "ORB_PLAY") and strategy.news_ok(thin, None)[0] is False
+    assert strategy.news_ok(thin, 1) == (True, "ORB_NEWS")  # good news lowers the volume bar
+    assert strategy.news_ok(in_play, -1)[0] is False  # never buy a breakout against its own news
+    fade, _ = strategy.fade_plan(103, 101, 2.0, 1.1)  # one ATR above VWAP on ordinary volume
+    assert fade["side"] == "SHORT" and fade["stop"] == 103.8 and fade["target"] == 101 and fade["setup"] == "VWAP_FADE", fade
+    assert strategy.fade_plan(103, 101, 2.0, 2.5)[1].startswith("in play")  # a stock in play has a reason to run
+    assert strategy.fade_plan(102, 101, 2.0, 1.1)[0] is None  # half an ATR is not stretched
+    half = pf.plan("LONG", 500, 494, None, 100000, 0, 5, risk_mult=0.5)
+    assert half["risk"] <= 250 and pf.plan("LONG", 500, 494, None, 100000, 0, 5, risk_mult=3)["risk"] <= 500, half
+
+
+def check_news_and_modes():
+    """News is scored before the open or not at all, and the day mode decides which sleeves may trade."""
+    fresh_book()
+    assert pf.news("RELIANCE", 1, "order win", now=at(8, 50))["status"] == "scored"
+    assert "hindsight" in pf.news("TCS", 1, "late", now=at(9, 40))["error"]
+    cand = lambda sym, rvol, side="LONG": {"symbol": sym, "segment": "LARGE", "industry": "X", "side": side,  # noqa: E731
+                                           "trigger": 501.0, "stop": 495.0, "or_rvol": rvol, "setup": "ORB_PLAY",
+                                           "state": "waiting"}
+    real = pf.scan, pf.day_mode, pf._news_today
+    try:
+        pf._news_today = lambda now: {"RELIANCE": {"score": 1, "reason": "order win"}, "INFY": {"score": -1, "reason": "guidance cut"}}
+        pf.scan = lambda top=None: {"mode": "range", "orb_risk_mult": 0.5,
+                                    "candidates": [cand("TCS", 3.0), cand("RELIANCE", 1.6), cand("INFY", 2.5), cand("SBIN", 1.6)]}
+        plan = pf.dayplan(now=at(9, 35))["candidates"]
+        by = {c["symbol"]: c for c in plan}
+        assert [c["symbol"] for c in plan][0] == "RELIANCE" and by["RELIANCE"]["setup"] == "ORB_NEWS" and by["RELIANCE"]["ok"], plan
+        assert by["TCS"]["ok"] and by["TCS"]["risk"] <= 250  # half risk on a range day
+        assert not by["INFY"]["ok"] and "SBIN" not in by  # against its news; thin volume without news
+
+        pf.day_mode = lambda: {"mode": "trend", "orb_risk_mult": 1.0}
+        assert "range day" in pf.open_position("SHORT", "RELIANCE", 500, 506, 488, setup="VWAP_FADE", now=at(11, 35))["error"]
+        pf.day_mode = lambda: {"mode": "range", "orb_risk_mult": 0.5}
+        assert pf.open_position("SHORT", "RELIANCE", 500, 506, 488, setup="VWAP_FADE", now=at(11, 35))["risk"] > 400  # fades keep full risk
+        assert pf.open_position("LONG", "TCS", **L, setup="ORB_PLAY", now=at(11, 36))["risk"] <= 250
+    finally:
+        pf.scan, pf.day_mode, pf._news_today = real
+
+
+def check_arm():
+    """An approved order waits at its trigger, fills as a stop order would, and never chases."""
+    fresh_book()
+    quiet = bars([(500, 500.4, 499.6, 500)] * 5, start="2026-10-30 09:46")
+    run = bars([(500, 500.4, 499.6, 500), (500.2, 502, 500.1, 501.8), (501.8, 503, 501.5, 502.5)], start="2026-10-30 09:51")
+    real = pf.get_bars, pf.get_quotes
+    try:
+        pf.get_quotes = lambda symbols: [{"symbol": s, "ltp": 500.0, "live": True} for s in symbols]
+        armed = pf.arm("LONG", "RELIANCE", 501, 495, now=at(9, 45))
+        assert armed["status"] == "armed" and armed["risk"] <= 500, armed
+        assert "already has an armed order" in pf.arm("LONG", "RELIANCE", 501, 495, now=at(9, 46))["error"]
+        assert "not in F&O" in pf.arm("SHORT", "NOTASTOCK", 499, 505, now=at(9, 46))["error"]
+        pf.get_quotes = lambda symbols: [{"symbol": s, "ltp": 503.0, "live": True} for s in symbols]
+        assert "do not chase" in pf.arm("LONG", "TCS", 501, 495, now=at(9, 46))["error"]  # a third of the stop past the trigger
+        assert "arming window" in pf.arm("LONG", "INFY", 501, 495, now=at(12, 30))["error"]
+
+        pf.get_quotes = lambda symbols: []
+        pf.get_bars = lambda symbols, period, interval, now=None: {"RELIANCE": quiet}
+        res = pf.monitor(now=at(9, 51))
+        assert not res["entries"] and [o["symbol"] for o in res["pending"]] == ["RELIANCE"], res
+        pf.get_bars = lambda symbols, period, interval, now=None: {"RELIANCE": pd.concat([quiet, run])}
+        res = pf.monitor(now=at(9, 54))
+        e = res["entries"][0]
+        assert e["symbol"] == "RELIANCE" and 501 < e["entry"] < 501.5 and not res["pending"] and len(res["open"]) == 1, res
+        assert pf._brief(res, at(9, 54)).startswith("ENTER RELIANCE LONG")
+        book = pf.load_portfolio(at(9, 54))
+        assert book["positions"][0]["opened_at"].endswith("09:52:00") and book["positions"][0]["target"] is None, book
+
+        fresh_book()  # an order nobody triggers is cancelled at its cut-off
+        pf.get_quotes = lambda symbols: [{"symbol": s, "ltp": 500.0, "live": True} for s in symbols]
+        pf.arm("LONG", "TCS", 501, 495, now=at(9, 45))
+        pf.get_quotes = lambda symbols: []
+        pf.get_bars = lambda symbols, period, interval, now=None: {"TCS": quiet}
+        assert not pf.monitor(now=at(12, 1))["pending"] and not pf.load_portfolio(at(12, 1))["positions"]
+        assert pf.disarm("all", now=at(12, 2))["symbols"] == []
+    finally:
+        pf.get_bars, pf.get_quotes = real
+
+
+def check_backtest():
+    """Two symbols over 40 sessions: one breaks out and runs on its heavy-volume days, the other is flat."""
+    days = pd.bdate_range("2026-01-05", periods=40)
+    def session(day, hot):
+        t = pd.date_range(day + pd.Timedelta(hours=9, minutes=15), periods=75, freq="5min")
+        px = [100 + (0.03 * i if hot else 0.0) for i in range(76)]
+        wig = [0.05 if i < 3 or hot else 1.0 for i in range(75)]  # quiet days still range Rs 2, which sets the ATR
+        return pd.DataFrame({"open": px[:-1], "high": [p + w for p, w in zip(px[1:], wig)],
+                             "low": [p - w for p, w in zip(px[:-1], wig)],
+                             "close": px[1:], "volume": [(9000 if hot else 1000) if i < 3 else 500 for i in range(75)]}, index=t)
+    raw = {"RELIANCE": pd.concat([session(d, i >= 25 and i % 3 == 0) for i, d in enumerate(days)]),
+           "TCS": pd.concat([session(d, False) for d in days])}
+    real = bt.MIN_TURNOVER_CR, bt.MIN_ATR_PCT
+    bt.MIN_TURNOVER_CR = bt.MIN_ATR_PCT = 0  # toy volumes
+    try:
+        trades = bt.simulate(bt.prepare(raw, strategy.PARAMS), strategy.PARAMS)
+    finally:
+        bt.MIN_TURNOVER_CR, bt.MIN_ATR_PCT = real
+    assert len(trades) == 5 and {t["symbol"] for t in trades} == {"RELIANCE"}, trades
+    assert all(t["reason"] == "square-off" and t["r"] > 1 for t in trades), trades
+    r = bt.report(trades)
+    assert r["n"] == 5 and not r["verdict"]["pass"] and "only 5 trades" in r["verdict"]["reasons"][0], r["verdict"]
+    assert set(r["by_setup"]) == {"ORB_PLAY"} and set(r["by_day_mode"]) == {"trend"}, r["by_day_mode"]  # the only moving stock opened up
+
+    def spike(day, stretched):  # a quiet stock that jumps Rs 3 at 11:00 on ordinary volume, then drifts back
+        t = pd.date_range(day + pd.Timedelta(hours=9, minutes=15), periods=75, freq="5min")
+        px = [100.0] * 21 + ([103.0] * 7 + [103 - 0.2 * i for i in range(1, 49)] if stretched else [100.0] * 55)
+        wig = 0.05 if stretched else 1.0
+        return pd.DataFrame({"open": px[:-1], "high": [max(a, b) + wig for a, b in zip(px[:-1], px[1:])],
+                             "low": [min(a, b) - wig for a, b in zip(px[:-1], px[1:])], "close": px[1:],
+                             "volume": [1000 if i < 3 else 500 for i in range(75)]}, index=t)
+    raw = {"RELIANCE": pd.concat([spike(d, i == 30) for i, d in enumerate(days)]),
+           "TCS": pd.concat([session(d, False) for d in days])}
+    bt.MIN_TURNOVER_CR = bt.MIN_ATR_PCT = 0
+    try:
+        fades = bt.simulate(bt.prepare(raw, strategy.PARAMS), strategy.PARAMS, sleeves=("fade",))
+    finally:
+        bt.MIN_TURNOVER_CR, bt.MIN_ATR_PCT = real
+    f = fades[0]
+    assert len(fades) == 1 and (f["setup"], f["side"], f["reason"]) == ("VWAP_FADE", "SHORT", "target") and f["r"] > 1.5, fades
 
 
 def fresh_book(*symbols):
     if os.path.exists(pf.PORTFOLIO_FILE):
         os.remove(pf.PORTFOLIO_FILE)
     for s in symbols:
-        assert pf.open_position("LONG", s, 500, 497.5, 507.5, now=at(10, 15))["status"] == "opened"
+        assert pf.open_position("LONG", s, **L, now=at(10, 15))["status"] == "opened"
 
 
 def check_monitor():
     flat = lambda n: bars([(500, 500.3, 499.8, 500)] * n, start="2026-10-30 10:17")  # noqa: E731
-    gap = bars([(500, 500.5, 499, 500), (480, 481, 479, 480)])  # the 10:17 bar opens 4% under the stop
+    gap = bars([(500, 500.5, 499, 500), (465, 466, 464, 465)])  # the 10:17 bar opens 6% under the stop
     real = pf.get_bars, pf.get_quotes
     try:
         pf.get_quotes = lambda symbols: []  # no nse-live price: the bars carry the day
@@ -125,16 +278,16 @@ def check_monitor():
             res = pf.monitor(now=when)
             # TCS is closed by the 15:15 square-off in the first pass and by the loss halt in the second
             assert sorted(e["reason"] for e in res["exits"]) == sorted(["stop", "square-off" if when.hour == 15 else "daily-loss-halt"]), res
-            assert res["halted"] and res["halt_triggered"] and not res["open"] and res["day_pnl"] < -2000, res
+            assert res["halted"] and res["halt_triggered"] and not res["open"] and res["day_pnl"] < -1500, res
             assert pf.monitor(now=when)["halted"] and not pf.monitor(now=when)["halt_triggered"]  # announced once, not every minute
-            assert "Daily loss limit" in pf.open_position("LONG", "INFY", 500, 497.5, 507.5, now=at(14, 0))["error"]
+            assert "Daily loss limit" in pf.open_position("LONG", "INFY", **L, now=at(14, 0))["error"]
 
         # nse-live is the primary price: with no bars, a live LTP through the stop closes at the market
         fresh_book("RELIANCE")
         pf.get_bars = lambda *a, **k: {}
-        pf.get_quotes = lambda symbols: [{"symbol": "RELIANCE", "ltp": 496.0, "live": True}]
+        pf.get_quotes = lambda symbols: [{"symbol": "RELIANCE", "ltp": 493.0, "live": True}]
         res = pf.monitor(now=at(12, 0))
-        assert [e["reason"] for e in res["exits"]] == ["stop"] and res["exits"][0]["exit"] < 496, res
+        assert [e["reason"] for e in res["exits"]] == ["stop"] and res["exits"][0]["exit"] < 493, res
 
         # no price at all: warn and keep the position, then square off even on a stale official price
         fresh_book("RELIANCE")
@@ -148,11 +301,11 @@ def check_monitor():
 
 
 def check_ltp_exit():
-    long_ = {"side": "LONG", "stop": 497.5, "stop0": 497.5, "target": 507.5}
-    assert pf._ltp_exit(long_, 497) == ("stop", 497) and pf._ltp_exit(long_, 508) == ("target", 507.5)
-    assert pf._ltp_exit(long_, 500) is None and pf._ltp_exit({**long_, "stop": 500.15}, 500) == ("trail-stop", 500)
-    short = {"side": "SHORT", "stop": 502.5, "stop0": 502.5, "target": 492.5}
-    assert pf._ltp_exit(short, 503) == ("stop", 503) and pf._ltp_exit(short, 492) == ("target", 492.5)
+    long_ = {"side": "LONG", "stop": 494, "stop0": 494, "target": 512}
+    assert pf._ltp_exit(long_, 493) == ("stop", 493) and pf._ltp_exit(long_, 513) == ("target", 512)
+    assert pf._ltp_exit(long_, 500) is None and pf._ltp_exit({**long_, "target": None}, 600) is None
+    short = {"side": "SHORT", "stop": 506, "stop0": 506, "target": 488}
+    assert pf._ltp_exit(short, 507) == ("stop", 507) and pf._ltp_exit(short, 487) == ("target", 488)
 
 
 RELIANCE = {"stock": {"symbol": "RELIANCE", "series": "EQ", "openPrice": 1170.4, "highPrice": 1174.6, "lowPrice": 1152.5,
@@ -242,13 +395,15 @@ def check_segments():
     assert len(uni) > 480 and sum(v["segment"] == "MID" for v in uni.values()) > 140, len(uni)
     assert md.segment_of("RELIANCE") == "LARGE" and md.segment_of("360ONE.NS") == "MID"
     assert md.segment_of("NOTASTOCK") == "SMALL"  # outside the Nifty 500: the most expensive to trade
-    large = pf.plan("LONG", 500, 497.5, 507.5, 100000, 0, 5, "LARGE")
-    mid = pf.plan("LONG", 500, 497.5, 507.5, 100000, 0, 3, "MID")
-    assert mid["net_rr"] < large["net_rr"] and mid["risk"] <= 1000 and not mid["problems"], (large, mid)
+    large = pf.plan("LONG", 500, 494, None, 100000, 0, 5, "LARGE")
+    mid = pf.plan("LONG", 500, 494, None, 100000, 0, 3, "MID")
+    assert mid["cost_r"] > large["cost_r"] and mid["risk"] <= 500 and not mid["problems"], (large, mid)
+    assert md.shortable("RELIANCE") and not md.shortable("NOTASTOCK")
+    assert md.SHORTLIST_CAPS["SMALL"] == 0  # smallcap costs are a third of a 1% stop
 
 
 def check_brief():
-    quiet = {"exits": [], "warnings": [], "halt_triggered": False, "day_pnl": 0}
+    quiet = {"entries": [], "exits": [], "warnings": [], "halt_triggered": False, "day_pnl": 0}
     assert pf._brief(quiet, at(11, 0)) == ""  # nothing happened: Hermes stays silent
     stop = {"symbol": "TCS", "side": "LONG", "reason": "stop", "net": -992.3, "r": -1.0}
     text = pf._brief({**quiet, "exits": [stop], "day_pnl": -992.3}, at(11, 0))
@@ -260,7 +415,7 @@ def check_brief():
 
 def check_note():
     fresh_book("RELIANCE")
-    assert pf.exit_position("RELIANCE", 497, "stop", now=at(11, 0))["status"] == "closed"
+    assert pf.exit_position("RELIANCE", 494, "stop", now=at(11, 0))["status"] == "closed"
     assert pf.note("RELIANCE", "broke out on fading volume", now=at(11, 5))["status"] == "noted"
     assert pf.load_portfolio(at(11, 5))["trades"][-1]["note"] == "broke out on fading volume"
     pf.note("RELIANCE.NS", "second thought", now=at(11, 6))

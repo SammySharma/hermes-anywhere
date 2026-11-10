@@ -11,7 +11,7 @@ docker exec -it hermes-intraday hermes cron list
 ```
 
 A complete setup has the six jobs below plus the existing `alpha-desk-squareoff` job at `45 9 * * 1-5` (15:15 IST).
-A job like `alpha-desk-morning-scan` at `20 5 * * 1-5` runs once a day at 10:50 IST. It is not the 15-minute scan, so remove it:
+A job like `alpha-desk-morning-scan` at `20 5 * * 1-5` runs at 10:50 IST, too late for the opening-range plan, so remove it:
 
 ```bash
 docker exec -it hermes-intraday hermes cron remove alpha-desk-morning-scan
@@ -22,15 +22,24 @@ docker exec -it hermes-intraday hermes cron remove alpha-desk-morning-scan
 Each one starts an agent turn with the skill loaded and sends the result to Telegram.
 
 ```bash
-docker exec -it hermes-intraday hermes cron create "50 3 * * 1-5" "Run the alpha-desk pre-session job: market_data.py status (stop if the market is closed), then market_data.py screen, then send the pre-session brief." --name alpha-desk-presession --skill alpha-desk --deliver telegram
+docker exec -it hermes-intraday hermes cron create "30 3 * * 1-5" "Run the alpha-desk pre-open news checklist, then send the pre-session brief." --name alpha-desk-presession --skill alpha-desk --deliver telegram
+```
+
+If an older `alpha-desk-presession` job exists at `50 3 * * 1-5` (09:20 IST), remove it first: news must be scored before the 09:15 open.
+
+```bash
+docker exec -it hermes-intraday hermes cron create "3 4 * * 1-5" "Run the alpha-desk morning plan checklist." --name alpha-desk-plan --skill alpha-desk --deliver telegram
 ```
 
 ```bash
-docker exec -it hermes-intraday hermes cron create "*/15 4-8 * * 1-5" "Run the alpha-desk scan turn checklist." --name alpha-desk-scan --skill alpha-desk --deliver telegram
+docker exec -it hermes-intraday hermes cron create "2 6-8 * * 1-5" "Run the alpha-desk fade checklist. Stay silent if there is nothing to propose." --name alpha-desk-fade --skill alpha-desk --deliver telegram
 ```
 
+The v2 desk scanned every 15 minutes. v3 fixes the day's orders at 09:30, so remove those jobs if you have them:
+
 ```bash
-docker exec -it hermes-intraday hermes cron create "0 9 * * 1-5" "Run the alpha-desk scan turn checklist." --name alpha-desk-scan-1430 --skill alpha-desk --deliver telegram
+docker exec -it hermes-intraday hermes cron remove alpha-desk-scan
+docker exec -it hermes-intraday hermes cron remove alpha-desk-scan-1430
 ```
 
 ```bash
@@ -76,9 +85,10 @@ docker exec --user hermes hermes-intraday sh /opt/data/scripts/alpha-desk-monito
 
 | Job | When (IST) | What happens |
 |-----|-----------|--------------|
-| `alpha-desk-presession` | 09:20 | Checks the market is open, builds the day's shortlist, sends the brief |
-| `alpha-desk-scan`, `alpha-desk-scan-1430` | 09:30 to 14:30, every 15 minutes | Checks positions, scans for setups, proposes a trade for your approval |
-| `alpha-desk-monitor` | 09:30 to 15:29, every minute | Books stop, target and breakeven exits, halts the day at -2%, sends a message only when something happened |
+| `alpha-desk-presession` | 09:00 | Builds the shortlist, scores overnight news before the open, sends the brief |
+| `alpha-desk-plan` | 09:33 | Classifies the day (trend or range), computes the opening-range orders and sends them for one approval |
+| `alpha-desk-fade` | 11:32, 12:32, 13:32 | On range days only: proposes fades of stretched stocks that have no news behind the move |
+| `alpha-desk-monitor` | 09:30 to 15:29, every minute | Fills approved orders at their trigger, books stops, cancels unfilled orders at 12:00, halts the day at -1.5%, sends a message only when something happened. Required: without it nothing trades |
 | `alpha-desk-squareoff` | 15:15 | Closes anything still open |
 | `alpha-desk-eod` | 15:45 | Daily review and end-of-day message |
 | `alpha-desk-weekly` | Sunday 10:00 | Weekly review, plus the monthly review on the first Sunday |
