@@ -9,12 +9,13 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import strategy
-from market_data import (DATA_DIR, ENTRY_START, IST, LAST_ENTRY, SQUARE_OFF, get_bars, get_quotes, now_ist, scan,
-                         segment_of, shortable)
+from market_data import (DATA_DIR, ENTRY_START, IST, LAST_ENTRY, OPEN, SQUARE_OFF, day_mode, fades, get_bars, get_quotes,
+                         now_ist, scan, segment_of, shortable)
 
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
 DECISIONS_FILE = os.path.join(DATA_DIR, "decisions_log.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
+NEWS_FILE = os.path.join(DATA_DIR, "news_scores.json")
 
 # Hard rules. They live here, not in markdown, so the self-improvement loop cannot loosen them.
 CAPITAL = 100000
@@ -134,8 +135,9 @@ def fill(order_side, px, seg="LARGE"):
 
 # --- sizing and rules ------------------------------------------------------------------------------------------------
 
-def plan(side, price, stop, target, equity, margin_used, mult, seg="LARGE"):
-    """Size a trade and check the price rules. Returns the numbers plus a list of problems (empty = tradable)."""
+def plan(side, price, stop, target, equity, margin_used, mult, seg="LARGE", risk_mult=1.0):
+    """Size a trade and check the price rules. Returns the numbers plus a list of problems (empty = tradable).
+    `risk_mult` can only shrink the risk budget (ORB orders on a range day)."""
     e, x = sides(side)
     sign = 1 if side == "LONG" else -1
     entry = fill(e, price, seg)
@@ -147,7 +149,7 @@ def plan(side, price, stop, target, equity, margin_used, mult, seg="LARGE"):
     stop_pct = risk_ps / entry * 100
     if stop_pct > STOP_MAX_PCT:
         problems.append(f"Stop is {stop_pct:.2f}% from entry; the maximum is {STOP_MAX_PCT}%")
-    budget = equity * RISK_PCT / 100
+    budget = equity * RISK_PCT / 100 * max(0.1, min(1.0, risk_mult))
     cap = min(equity * LEVERAGE / MAX_POSITIONS, (equity - margin_used) * mult)
 
     def net_at(px, q):
@@ -188,9 +190,20 @@ def size(symbol, side, price, stop, target=None, mult=None, now=None):
 
 # --- entries and exits -----------------------------------------------------------------------------------------------
 
-def _admit(pf, now, symbol, side, pending=False):
+def _risk_mult(setup):
+    """Risk scale for a setup today. ORB orders shrink on a range day; the mode comes from the morning scan, not the caller."""
+    mode = day_mode()
+    return mode["orb_risk_mult"] if mode and setup.startswith("ORB") else 1.0
+
+
+def _admit(pf, now, symbol, side, pending=False, setup=""):
     """Book-level reasons a new entry (or a new armed order) is not allowed right now."""
     d, problems = pf["day"], []
+    if setup == "VWAP_FADE":
+        mode = day_mode()
+        if not mode or mode["mode"] != "range":
+            problems.append("Fades are allowed only on a range day (run dayplan first; today is "
+                            f"{mode['mode'] if mode else 'unclassified'})")
     if d["halted"] or pf["cash"] - d["start_equity"] <= -DAILY_LOSS_PCT / 100 * d["start_equity"]:
         problems.append("Daily loss limit reached; no new entries today")
     if d["trades_opened"] >= MAX_TRADES_PER_DAY:
@@ -209,10 +222,10 @@ def _admit(pf, now, symbol, side, pending=False):
 def _enter(pf, now, side, symbol, price, stop, target=None, qty=None, setup="", thesis="", sector="",
            confidence="medium", mult=None):
     """Open a position at `price` (before slippage) if every rule allows it. Returns (result, problems)."""
-    problems = _admit(pf, now, symbol, side)
+    problems = _admit(pf, now, symbol, side, setup=setup)
     seg = segment_of(symbol)
     mult = min(mult or SEGMENTS[seg]["mult"], LEVERAGE)
-    pl = plan(side, price, stop, target, pf["cash"], _margin_used(pf), mult, seg)
+    pl = plan(side, price, stop, target, pf["cash"], _margin_used(pf), mult, seg, _risk_mult(setup))
     problems += pl["problems"]
     if qty and pl.get("qty") and qty > pl["qty"]:
         problems.append(f"Qty {qty} exceeds the maximum {pl['qty']} for this stop")
@@ -260,7 +273,9 @@ def arm(side, symbol, trigger, stop, target=None, qty=None, setup="ORB_PLAY", th
     sign = 1 if side == "LONG" else -1
     with lock():
         pf = load_portfolio(now)
-        problems = _admit(pf, now, symbol, side, pending=True)
+        problems = _admit(pf, now, symbol, side, pending=True, setup=setup)
+        if not setup.startswith("ORB"):
+            problems.append("Only ORB orders are armed. A fade is entered with long or short after approval")
         if not ENTRY_START <= now.time() <= LAST_ENTRY or now.strftime("%H:%M") >= until:
             problems.append(f"Outside the arming window (09:30 to {until} IST)")
         if any(o["symbol"] == symbol for o in pf["pending"]):
@@ -269,7 +284,7 @@ def arm(side, symbol, trigger, stop, target=None, qty=None, setup="ORB_PLAY", th
             problems.append(f"Already {MAX_PENDING} armed orders")
         seg = segment_of(symbol)
         m = min(mult or SEGMENTS[seg]["mult"], LEVERAGE)
-        pl = plan(side, trigger, stop, target, pf["cash"], _margin_used(pf), m, seg)
+        pl = plan(side, trigger, stop, target, pf["cash"], _margin_used(pf), m, seg, _risk_mult(setup))
         problems += pl["problems"]
         q = (get_quotes([symbol]) or [{}])[0]
         if q.get("ltp") and q.get("live") and (q["ltp"] - trigger) * sign > strategy.PARAMS["extended_r"] * abs(trigger - stop):
@@ -549,23 +564,74 @@ def value(now=None):
             "day_pnl": round(equity - pf["day"]["start_equity"], 2), "positions": rows}
 
 
+def _news_today(now):
+    return load_json(NEWS_FILE, {}).get(now.date().isoformat(), {})
+
+
+def news(symbol, score, reason, now=None):
+    """Record the agent's reading of a stock's overnight news: +1 good, -1 bad, 0 neutral. Only before the open, so a
+    score can never be written with the day's price action in view."""
+    now = now or now_ist()
+    if now.time() >= OPEN:
+        return {"error": "News is scored before 09:15 IST. A score written after the open is hindsight and is refused."}
+    if score not in (-1, 0, 1):
+        return {"error": "Score must be -1, 0 or 1"}
+    with lock():
+        allnews = load_json(NEWS_FILE, {})
+        day = allnews.setdefault(now.date().isoformat(), {})
+        day[norm(symbol)] = {"score": score, "reason": reason, "time": _ts(now)}
+        save_json(NEWS_FILE, {k: allnews[k] for k in sorted(allnews)[-30:]})
+        log_decision({"type": "news", "time": _ts(now), "symbol": norm(symbol), "score": score, "reason": reason})
+    return {"status": "scored", "symbol": norm(symbol), "score": score, "scored_today": len(day)}
+
+
 def dayplan(top=None, now=None):
     """Today's ORB candidates from `market_data.scan`, each sized against the book. Levels come from code, never
-    from the agent: it may veto a name, not move a trigger or a stop."""
+    from the agent: it may veto a name, not move a trigger or a stop. Pre-open news scores decide which names below
+    the in-play volume bar still qualify, and block any order against its own news."""
     now = now or now_ist()
     res = scan(top)
+    if "error" in res:
+        return res
+    pf, scores, keep = load_portfolio(now), _news_today(now), []
+    for c in res["candidates"]:
+        n = scores.get(c["symbol"])
+        tradable, c["setup"] = strategy.news_ok(c, n["score"] if n else None)
+        c["news"] = n and {"score": n["score"], "reason": n["reason"]}
+        if not tradable and not (n and n["score"]):
+            continue  # ordinary volume and no news: not a candidate at all
+        seg = c["segment"]
+        pl = plan(c["side"], c["trigger"], c["stop"], None, pf["cash"], _margin_used(pf), SEGMENTS[seg]["mult"], seg,
+                  res["orb_risk_mult"])
+        problems = pl["problems"] + _admit(pf, now, c["symbol"], c["side"], pending=True)
+        if not tradable:
+            problems.append("the pre-open news score is against this order")
+        if c["state"] == "extended":
+            problems.append("already well past the trigger; do not chase")
+        c.update(qty=pl.get("qty"), risk=pl.get("risk"), cost_r=pl.get("cost_r"), ok=not problems, problems=problems)
+        keep.append(c)
+    # news-backed orders first, then by opening volume
+    keep.sort(key=lambda c: (c["setup"] != "ORB_NEWS", -c["or_rvol"]))
+    res["candidates"] = keep[:top or strategy.PARAMS["top"]]
+    res["armed"] = [o["symbol"] for o in pf["pending"]]
+    res["open"] = [p["symbol"] for p in pf["positions"]]
+    return res
+
+
+def fadeplan(now=None):
+    """Reversal candidates on a range day, each sized against the book. The agent's one job here is the news check:
+    a stretched stock with news behind the move is vetoed, not faded."""
+    now = now or now_ist()
+    res = fades()
     if "error" in res:
         return res
     pf = load_portfolio(now)
     for c in res["candidates"]:
         seg = c["segment"]
-        pl = plan(c["side"], c["trigger"], c["stop"], None, pf["cash"], _margin_used(pf), SEGMENTS[seg]["mult"], seg)
-        problems = pl["problems"] + _admit(pf, now, c["symbol"], c["side"], pending=True)
-        if c["state"] == "extended":
-            problems.append("already well past the trigger; do not chase")
-        c.update(qty=pl.get("qty"), risk=pl.get("risk"), cost_r=pl.get("cost_r"), ok=not problems, problems=problems)
-    res["armed"] = [o["symbol"] for o in pf["pending"]]
-    res["open"] = [p["symbol"] for p in pf["positions"]]
+        pl = plan(c["side"], c["ltp"], c["stop"], c["target"], pf["cash"], _margin_used(pf), SEGMENTS[seg]["mult"], seg)
+        problems = pl["problems"] + _admit(pf, now, c["symbol"], c["side"], setup="VWAP_FADE")
+        c.update(qty=pl.get("qty"), risk=pl.get("risk"), cost_r=pl.get("cost_r"), net_rr=pl.get("net_rr"),
+                 ok=not problems, problems=problems)
     return res
 
 
@@ -588,6 +654,11 @@ def main():
     sub.add_parser("monitor").add_argument("--brief", action="store_true",
                                            help="print nothing unless a position closed or the day halted")
     sub.add_parser("dayplan", help="today's ORB candidates, sized").add_argument("--top", type=int)
+    sub.add_parser("fadeplan", help="reversal candidates on a range day, sized")
+    nw = sub.add_parser("news", help="score a stock's overnight news before the open")
+    nw.add_argument("symbol")
+    nw.add_argument("--score", type=int, choices=[-1, 0, 1], required=True)
+    nw.add_argument("--reason", required=True)
     g = sub.add_parser("arm", help="arm a stop-entry order from the day plan")
     g.add_argument("symbol")
     g.add_argument("--side", choices=["long", "short"], required=True)
@@ -642,6 +713,10 @@ def main():
             result = monitor()
         elif a.cmd == "dayplan":
             result = dayplan(a.top)
+        elif a.cmd == "fadeplan":
+            result = fadeplan()
+        elif a.cmd == "news":
+            result = news(a.symbol, a.score, a.reason)
         elif a.cmd == "arm":
             result = arm(a.side.upper(), a.symbol, a.trigger, a.stop, a.target, a.qty, a.setup, a.thesis, a.sector,
                          a.mult, a.until)
@@ -671,7 +746,7 @@ def main():
         if text:
             print(text)
         return
-    print(json.dumps(result, separators=(",", ":")) if a.cmd == "dayplan" else json.dumps(result, indent=2))
+    print(json.dumps(result, separators=(",", ":")) if a.cmd in ("dayplan", "fadeplan") else json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

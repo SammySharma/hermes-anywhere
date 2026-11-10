@@ -484,29 +484,44 @@ def regime():
     return {"nifty": side(etf[NIFTY_ETF], nifty), "midcap150": side(etf[MID_ETF], mid), "india_vix": vix}
 
 
+def _opening(d, now, p):
+    """(today's bars, opening-range bars, the same window's volume on prior sessions), or None if today's session is
+    missing or did not start at 09:15."""
+    end = strategy.or_end(p)
+    days = [g for _, g in d.groupby(d.index.date)]
+    cur = days[-1]
+    if cur.index[-1].date() != now.date() or cur.index[0].time() != OPEN:
+        return None
+    vols = []
+    for g in days[:-1]:
+        w = g[g.index.time < end]
+        if not w.empty and w.index[0].time() == OPEN:
+            vols.append(float(w["Volume"].sum()))
+    return cur, cur[cur.index.time < end], vols
+
+
 def _candidates(frames, meta, now, p=None):
     """The day's ORB orders from 15-minute frames ({symbol: bars}) and the shortlist rows, ranked by opening-range
     relative volume. Pure, so the selftest and the backtester exercise the same rules as the live scan."""
+    return _opening_scan(frames, meta, now, p)[0]
+
+
+def _opening_scan(frames, meta, now, p=None):
+    """(ORB candidates, day mode, breadth). The mode comes from how many shortlist opening candles closed up or down."""
     p = p or strategy.PARAMS
-    end, out = strategy.or_end(p), []
+    end, out, ups, downs = strategy.or_end(p), [], 0, 0
     if now.time() < end:
-        return out
+        return out, "range", 0.0
     for sym, m in meta.items():
         d = frames.get(sym)
-        if d is None or d.empty:
+        got = _opening(d, now, p) if d is not None and not d.empty else None
+        if not got:
             continue
-        days = [g for _, g in d.groupby(d.index.date)]
-        cur = days[-1]
-        if cur.index[-1].date() != now.date() or cur.index[0].time() != OPEN:
-            continue
-        orb, vols = cur[cur.index.time < end], []
-        for g in days[:-1]:
-            w = g[g.index.time < end]
-            if not w.empty and w.index[0].time() == OPEN:
-                vols.append(float(w["Volume"].sum()))
-        plan, _ = strategy.opening_plan(float(orb["Open"].iloc[0]), float(orb["High"].max()), float(orb["Low"].min()),
-                                        float(orb["Close"].iloc[-1]), float(orb["Volume"].sum()), vols,
-                                        m["atr_pct"] / 100 * m["prev_close"], p)
+        cur, orb, vols = got
+        o, c = float(orb["Open"].iloc[0]), float(orb["Close"].iloc[-1])
+        ups, downs = ups + (c > o), downs + (c < o)
+        plan, _ = strategy.opening_plan(o, float(orb["High"].max()), float(orb["Low"].min()), c,
+                                        float(orb["Volume"].sum()), vols, m["atr_pct"] / 100 * m["prev_close"], p)
         if not plan:
             continue
         after = cur[cur.index.time >= end]
@@ -514,7 +529,75 @@ def _candidates(frames, meta, now, p=None):
                     "ltp": _r(cur["Close"].iloc[-1]), "atr_pct": m["atr_pct"], "turnover_cr": m["turnover_cr"],
                     "state": _state(plan, after["High"].max() if not after.empty else None,
                                     after["Low"].min() if not after.empty else None, float(cur["Close"].iloc[-1]), p)})
-    return sorted(out, key=lambda c: -c["or_rvol"])
+    mode, breadth = strategy.day_mode(ups, downs, p)
+    return sorted(out, key=lambda c: -c["or_rvol"]), mode, breadth
+
+
+def _fades(frames, meta, now, p=None):
+    """Reversal candidates from 15-minute frames: stocks stretched from session VWAP that were not in play at the open,
+    most stretched first. Uses completed bars only."""
+    p = p or strategy.PARAMS
+    out = []
+    for sym, m in meta.items():
+        d = frames.get(sym)
+        got = _opening(d, now, p) if d is not None and not d.empty else None
+        if not got:
+            continue
+        cur, orb, vols = got
+        done = cur[cur.index + timedelta(minutes=15) <= now]
+        prior = [v for v in vols if v > 0][-p["rvol_days"]:]
+        if len(done) < 4 or len(prior) < p["min_rvol_days"]:
+            continue
+        rvol = float(orb["Volume"].sum()) / (sum(prior) / len(prior))
+        plan, _ = strategy.fade_plan(float(done["Close"].iloc[-1]), float(_vwap(done).iloc[-1]),
+                                     m["atr_pct"] / 100 * m["prev_close"], rvol, p)
+        if plan:
+            out.append({"symbol": sym, "segment": m["segment"], "industry": m["industry"], **plan})
+    return sorted(out, key=lambda c: -abs(c["stretch_atr"]))[:p["fade_top"]]
+
+
+def day_mode():
+    """Today's cached mode from the morning scan: {"mode", "breadth", "orb_risk_mult"}, or None before the scan ran."""
+    m = _load(os.path.join(DATA_DIR, "daymode.json"))
+    return m if m and m.get("date") == now_ist().date().isoformat() else None
+
+
+def _bars15(meta, now):
+    frames = {y[:-3]: d[d.index <= now] for y, d in _download([s + ".NS" for s in meta], "1mo", "15m").items()}
+    last = max((d.index[-1] for d in frames.values() if not d.empty), default=None)
+    if last is None or last.date() != now.date():
+        return None, {"error": "No intraday bars for today yet; retry in two minutes. Do not trade without them."}
+    age = (now - last).total_seconds() / 60
+    if age > STALE_BAR_MIN + 15:
+        return None, {"error": f"Stale bars: last bar {last.strftime('%H:%M')} IST, {age:.0f} min old."}
+    return frames, last
+
+
+def fades():
+    """Reversal candidates for a range day, at the fixed check times in strategy.py. Empty on a trend day."""
+    p = strategy.PARAMS
+    st = status()
+    if st["state"] != "open":
+        return {"error": st.get("error") or f"Market not open ({st['state']})", **st}
+    now, mode = now_ist(), day_mode()
+    if not mode:
+        return {"error": "No day mode yet: run the morning plan (dayplan) first."}
+    hhmm = now.strftime("%H:%M")
+    if mode["mode"] != "range" or not p["fade_times"][0] <= hhmm <= "14:00":
+        return {"time_ist": hhmm, "mode": mode["mode"], "candidates": [],
+                "note": "Fades run only on range days, between the first check time and 14:00."}
+    sl = shortlist()
+    if "error" in sl:
+        return sl
+    meta = {r["symbol"]: r for r in sl["symbols"]}
+    frames, last = _bars15(meta, now)
+    if frames is None:
+        return last
+    cands = _fades(frames, meta, now, p)
+    for c, q in zip(cands, get_quotes([c["symbol"] for c in cands])):
+        c["ltp"], c["src"] = (q["ltp"], q["src"]) if q.get("ltp") and q.get("live") else (c["entry_ref"], "yfinance")
+        c["shortable"] = c["side"] == "LONG" or shortable(c["symbol"])
+    return {"time_ist": hhmm, "mode": "range", "last_bar": last.strftime("%H:%M"), "candidates": cands}
 
 
 def _state(plan, hi, lo, ltp, p):
@@ -540,16 +623,17 @@ def scan(top=None):
     if "error" in sl:
         return sl
     meta = {r["symbol"]: r for r in sl["symbols"]}
-    frames = {y[:-3]: d[d.index <= now] for y, d in _download([s + ".NS" for s in meta], "1mo", "15m").items()}
-    last = max((d.index[-1] for d in frames.values() if not d.empty), default=None)
-    if last is None or last.date() != now.date():
-        return {"error": "No intraday bars for today yet; retry in two minutes. Do not trade without them."}
-    age = (now - last).total_seconds() / 60
-    if age > STALE_BAR_MIN + 15:
-        return {"error": f"Stale bars: last bar {last.strftime('%H:%M')} IST, {age:.0f} min old."}
+    frames, last = _bars15(meta, now)
+    if frames is None:
+        return last
 
     reg = regime()
-    cands = _candidates(frames, meta, now, p)[:top or p["top"]]
+    cands, mode, breadth = _opening_scan(frames, meta, now, p)
+    cands = cands[:(top or p["top"]) * 2]  # extra depth: names below the in-play bar survive only with scored news
+    mult = strategy.orb_risk_mult(mode, p)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(os.path.join(DATA_DIR, "daymode.json"), "w") as f:
+        json.dump({"date": now.date().isoformat(), "mode": mode, "breadth": breadth, "orb_risk_mult": mult}, f)
     for c, q in zip(cands, get_quotes([c["symbol"] for c in cands])):
         if q.get("ltp") and q.get("live"):
             c.update(ltp=q["ltp"], src=q["src"])
@@ -561,6 +645,7 @@ def scan(top=None):
         c["with_index"] = None if side is None else (c["side"] == "LONG") == (side == "above")
         c["shortable"] = c["side"] == "LONG" or shortable(c["symbol"])
     return {"time_ist": now.strftime("%Y-%m-%d %H:%M"), "last_bar": last.strftime("%H:%M"), "regime": reg,
+            "mode": mode, "breadth": breadth, "orb_risk_mult": mult,
             "shortlist": len(meta), "entry_until": p["entry_until"], "candidates": cands}
 
 
@@ -581,6 +666,7 @@ def main():
     sub.add_parser("universe", help="Nifty 500 EQ constituents by segment and industry")
     sub.add_parser("screen", help="rebuild the liquid shortlist now")
     sub.add_parser("regime", help="Nifty 50 and Midcap 150 backdrop plus India VIX")
+    sub.add_parser("fades", help="reversal candidates on a range day")
     s = sub.add_parser("scan", help="today's opening-range orders on the shortlist")
     s.add_argument("--top", type=int)
     sub.add_parser("price").add_argument("symbol")
@@ -602,6 +688,8 @@ def main():
         result = screen()
     elif a.cmd == "regime":
         result = regime()
+    elif a.cmd == "fades":
+        result = fades()
     elif a.cmd == "scan":
         result = scan(a.top)
     elif a.cmd == "price":

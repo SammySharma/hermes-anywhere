@@ -25,6 +25,7 @@ md.DATA_DIR = pf.DATA_DIR = DATA
 pf.PORTFOLIO_FILE = perf.PORTFOLIO_FILE = os.path.join(DATA, "portfolio.json")
 pf.DECISIONS_FILE = os.path.join(DATA, "decisions_log.json")
 pf.LOCK_FILE = os.path.join(DATA, ".lock")
+pf.NEWS_FILE = os.path.join(DATA, "news_scores.json")
 
 
 md.fno_symbols = lambda refresh=False: None  # no F&O file offline: the Nifty 100 stands in for it
@@ -133,6 +134,50 @@ def check_strategy():
     assert "ATR" in strategy.opening_plan(100, 103, 99.9, 102.5, 5000, [1000] * 8, 2.0)[1]  # the move is already spent
 
 
+def check_sleeves():
+    assert strategy.day_mode(80, 20) == ("trend", 0.6) and strategy.day_mode(55, 45)[0] == "range"
+    assert strategy.orb_risk_mult("trend") == 1.0 and strategy.orb_risk_mult("range") == 0.5
+    in_play = {"side": "LONG", "or_rvol": 2.4, "setup": "ORB_PLAY"}
+    thin = {"side": "LONG", "or_rvol": 1.6, "setup": "ORB_PLAY"}
+    assert strategy.news_ok(in_play, None) == (True, "ORB_PLAY") and strategy.news_ok(thin, None)[0] is False
+    assert strategy.news_ok(thin, 1) == (True, "ORB_NEWS")  # good news lowers the volume bar
+    assert strategy.news_ok(in_play, -1)[0] is False  # never buy a breakout against its own news
+    fade, _ = strategy.fade_plan(103, 101, 2.0, 1.1)  # one ATR above VWAP on ordinary volume
+    assert fade["side"] == "SHORT" and fade["stop"] == 103.8 and fade["target"] == 101 and fade["setup"] == "VWAP_FADE", fade
+    assert strategy.fade_plan(103, 101, 2.0, 2.5)[1].startswith("in play")  # a stock in play has a reason to run
+    assert strategy.fade_plan(102, 101, 2.0, 1.1)[0] is None  # half an ATR is not stretched
+    half = pf.plan("LONG", 500, 494, None, 100000, 0, 5, risk_mult=0.5)
+    assert half["risk"] <= 250 and pf.plan("LONG", 500, 494, None, 100000, 0, 5, risk_mult=3)["risk"] <= 500, half
+
+
+def check_news_and_modes():
+    """News is scored before the open or not at all, and the day mode decides which sleeves may trade."""
+    fresh_book()
+    assert pf.news("RELIANCE", 1, "order win", now=at(8, 50))["status"] == "scored"
+    assert "hindsight" in pf.news("TCS", 1, "late", now=at(9, 40))["error"]
+    cand = lambda sym, rvol, side="LONG": {"symbol": sym, "segment": "LARGE", "industry": "X", "side": side,  # noqa: E731
+                                           "trigger": 501.0, "stop": 495.0, "or_rvol": rvol, "setup": "ORB_PLAY",
+                                           "state": "waiting"}
+    real = pf.scan, pf.day_mode, pf._news_today
+    try:
+        pf._news_today = lambda now: {"RELIANCE": {"score": 1, "reason": "order win"}, "INFY": {"score": -1, "reason": "guidance cut"}}
+        pf.scan = lambda top=None: {"mode": "range", "orb_risk_mult": 0.5,
+                                    "candidates": [cand("TCS", 3.0), cand("RELIANCE", 1.6), cand("INFY", 2.5), cand("SBIN", 1.6)]}
+        plan = pf.dayplan(now=at(9, 35))["candidates"]
+        by = {c["symbol"]: c for c in plan}
+        assert [c["symbol"] for c in plan][0] == "RELIANCE" and by["RELIANCE"]["setup"] == "ORB_NEWS" and by["RELIANCE"]["ok"], plan
+        assert by["TCS"]["ok"] and by["TCS"]["risk"] <= 250  # half risk on a range day
+        assert not by["INFY"]["ok"] and "SBIN" not in by  # against its news; thin volume without news
+
+        pf.day_mode = lambda: {"mode": "trend", "orb_risk_mult": 1.0}
+        assert "range day" in pf.open_position("SHORT", "RELIANCE", 500, 506, 488, setup="VWAP_FADE", now=at(11, 35))["error"]
+        pf.day_mode = lambda: {"mode": "range", "orb_risk_mult": 0.5}
+        assert pf.open_position("SHORT", "RELIANCE", 500, 506, 488, setup="VWAP_FADE", now=at(11, 35))["risk"] > 400  # fades keep full risk
+        assert pf.open_position("LONG", "TCS", **L, setup="ORB_PLAY", now=at(11, 36))["risk"] <= 250
+    finally:
+        pf.scan, pf.day_mode, pf._news_today = real
+
+
 def check_arm():
     """An approved order waits at its trigger, fills as a stop order would, and never chases."""
     fresh_book()
@@ -194,6 +239,24 @@ def check_backtest():
     assert all(t["reason"] == "square-off" and t["r"] > 1 for t in trades), trades
     r = bt.report(trades)
     assert r["n"] == 5 and not r["verdict"]["pass"] and "only 5 trades" in r["verdict"]["reasons"][0], r["verdict"]
+    assert set(r["by_setup"]) == {"ORB_PLAY"} and set(r["by_day_mode"]) == {"trend"}, r["by_day_mode"]  # the only moving stock opened up
+
+    def spike(day, stretched):  # a quiet stock that jumps Rs 3 at 11:00 on ordinary volume, then drifts back
+        t = pd.date_range(day + pd.Timedelta(hours=9, minutes=15), periods=75, freq="5min")
+        px = [100.0] * 21 + ([103.0] * 7 + [103 - 0.2 * i for i in range(1, 49)] if stretched else [100.0] * 55)
+        wig = 0.05 if stretched else 1.0
+        return pd.DataFrame({"open": px[:-1], "high": [max(a, b) + wig for a, b in zip(px[:-1], px[1:])],
+                             "low": [min(a, b) - wig for a, b in zip(px[:-1], px[1:])], "close": px[1:],
+                             "volume": [1000 if i < 3 else 500 for i in range(75)]}, index=t)
+    raw = {"RELIANCE": pd.concat([spike(d, i == 30) for i, d in enumerate(days)]),
+           "TCS": pd.concat([session(d, False) for d in days])}
+    bt.MIN_TURNOVER_CR = bt.MIN_ATR_PCT = 0
+    try:
+        fades = bt.simulate(bt.prepare(raw, strategy.PARAMS), strategy.PARAMS, sleeves=("fade",))
+    finally:
+        bt.MIN_TURNOVER_CR, bt.MIN_ATR_PCT = real
+    f = fades[0]
+    assert len(fades) == 1 and (f["setup"], f["side"], f["reason"]) == ("VWAP_FADE", "SHORT", "target") and f["r"] > 1.5, fades
 
 
 def fresh_book(*symbols):

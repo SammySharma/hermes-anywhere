@@ -6,6 +6,7 @@
   python backtest.py run --data bars/                                            # the v3 rules
   python backtest.py run --data bars/ --target-r 1.8 --breakeven --set stop_atr=0.25   # the old exit style, to compare
   python backtest.py run --data bars/ --sweep                                    # is the result a plateau or a spike?
+  python backtest.py run --data bars/ --sleeves fade                             # one sleeve on its own
 
 Data: one CSV per symbol in the folder (SYMBOL.csv: time,open,high,low,close,volume; IST; 1, 5 or 15-minute bars).
 Use 1 or 5-minute bars. With 15-minute bars a trigger and a stop inside one bar are counted as a loss, which is harsh.
@@ -106,14 +107,17 @@ def regimes(data):
 
 # --- simulation -------------------------------------------------------------------------------------------------------
 
-def simulate(data, p, target_r=None, breakeven=False, capital=pf.CAPITAL):
+def simulate(data, p, target_r=None, breakeven=False, capital=pf.CAPITAL, sleeves=("orb", "fade")):
+    """Trade every session in `data`. Each day: classify the open (trend or range) from the opening candles of the
+    eligible stocks, arm the ORB orders, and on range days evaluate fades at the fixed check times.
+    The news sleeve is absent: there is no honest way to replay what the agent would have read."""
     uni = load_universe()
     reg = regimes(data)
     all_days = sorted({d for x in data.values() for d in x["days"]})
-    until = _mins(strategy.until(p))
+    until, fade_at = _mins(strategy.until(p)), set(strategy.fade_minutes(p))
     equity, trades = float(capital), []
     for day in all_days:
-        cands = []
+        cands, elig, ups, downs = [], {}, 0, 0
         for sym, x in data.items():
             if day not in x["days"] or day not in x["daily"].index:
                 continue
@@ -124,18 +128,33 @@ def simulate(data, p, target_r=None, breakeven=False, capital=pf.CAPITAL):
             if t["prev_close"] < MIN_PRICE or t["turnover_cr"] < MIN_TURNOVER_CR or t["atr"] / t["prev_close"] * 100 < MIN_ATR_PCT:
                 continue
             hist = x["daily"]["ov"]
-            prior = hist[hist.index < day].tail(p["rvol_days"]).tolist()
+            prior = [v for v in hist[hist.index < day].tail(p["rvol_days"]).tolist() if v > 0]
+            rvol = t["ov"] / (sum(prior) / len(prior)) if len(prior) >= p["min_rvol_days"] else None
+            elig[sym] = {"segment": seg, "atr": t["atr"], "or_rvol": rvol}
+            ups, downs = ups + (t["oc"] > t["oo"]), downs + (t["oc"] < t["oo"])
             plan, _ = strategy.opening_plan(t["oo"], t["oh"], t["ol"], t["oc"], t["ov"], prior, t["atr"], p)
-            if plan and (plan["side"] == "LONG" or shortable(sym)):
+            if plan and strategy.news_ok(plan, None, p)[0] and (plan["side"] == "LONG" or shortable(sym)):
                 cands.append({"symbol": sym, "segment": seg, **plan})
-        cands = sorted(cands, key=lambda c: -c["or_rvol"])[:p["top"]]
-        if not cands:
+        if not elig:
+            continue
+        mode, _ = strategy.day_mode(ups, downs, p)
+        orb_mult = strategy.orb_risk_mult(mode, p)
+        cands = sorted(cands, key=lambda c: -c["or_rvol"])[:p["top"]] if "orb" in sleeves else []
+        do_fades = "fade" in sleeves and mode == "range"
+        if not cands and not do_fades:
             continue
 
-        start_eq, opened, halted, pending, open_ = equity, 0, False, list(cands), []
-        bars = {c["symbol"]: data[c["symbol"]]["days"][day] for c in cands}
-        pos_of = {s: {int(m): i for i, m in enumerate(b[0])} for s, b in bars.items()}
-        clock = sorted({int(m) for b in bars.values() for m in b[0][b[6]:]})
+        start_eq, opened, halted, pending, open_, used_syms = equity, 0, False, list(cands), [], set()
+        bars, pos_of = {}, {}
+
+        def B(sym):
+            if sym not in bars:
+                bars[sym] = data[sym]["days"][day]
+                pos_of[sym] = {int(m): i for i, m in enumerate(bars[sym][0])}
+            return bars[sym]
+
+        ref = [c["symbol"] for c in cands] + (list(elig)[:25] if do_fades else [])
+        clock = sorted({int(m) for sym in ref for m in B(sym)[0][B(sym)[6]:]})
 
         def close(pos, px, reason, minute):
             nonlocal equity
@@ -146,9 +165,32 @@ def simulate(data, p, target_r=None, breakeven=False, capital=pf.CAPITAL):
             equity += net
             open_.remove(pos)
             trades.append({"day": day, "symbol": pos["symbol"], "side": pos["side"], "segment": pos["segment"],
-                           "regime": reg.get(day, "unknown"), "net": net, "r": net / pos["risk"], "reason": reason,
-                           "cost_r": pos["cost_r"], "or_rvol": pos["or_rvol"], "hold_min": minute - pos["minute"],
-                           "equity": equity})
+                           "setup": pos["setup"], "mode": mode, "regime": reg.get(day, "unknown"), "net": net,
+                           "r": net / pos["risk"], "reason": reason, "cost_r": pos["cost_r"],
+                           "hold_min": minute - pos["minute"], "equity": equity})
+
+        def enter(c, px, target, risk_mult, minute, i):
+            """Open `c` at `px` if the book allows it; a bar that also reaches the stop is counted as a stop."""
+            nonlocal opened
+            if halted or opened >= pf.MAX_TRADES_PER_DAY or len(open_) >= pf.MAX_POSITIONS:
+                return
+            seg, sgn = c["segment"], (1 if c["side"] == "LONG" else -1)
+            used = sum(q["qty"] * q["entry"] / pf.SEGMENTS[q["segment"]]["mult"] for q in open_)
+            pl = pf.plan(c["side"], px, c["stop"], target, equity, used, pf.SEGMENTS[seg]["mult"], seg, risk_mult)
+            if pl["problems"]:
+                return
+            e_side, _ = pf.sides(c["side"])
+            if target is None and target_r:
+                target = pl["entry"] + sgn * target_r * abs(pl["entry"] - c["stop"])
+            pos = {"symbol": c["symbol"], "side": c["side"], "segment": seg, "qty": pl["qty"], "entry": pl["entry"],
+                   "stop": c["stop"], "stop0": c["stop"], "risk": pl["risk"], "cost_r": pl["cost_r"], "target": target,
+                   "fees_in": pf.charges(e_side, pl["qty"] * pl["entry"]), "setup": c["setup"], "minute": minute}
+            open_.append(pos)
+            opened += 1
+            used_syms.add(c["symbol"])
+            _, _, h, l, _, _, _ = B(c["symbol"])
+            if ((l[i] if sgn > 0 else h[i]) - c["stop"]) * sgn <= 0:
+                close(pos, c["stop"], "stop", minute)
 
         for minute in clock:
             if minute >= SQUARE_OFF_MIN:
@@ -165,49 +207,46 @@ def simulate(data, p, target_r=None, breakeven=False, capital=pf.CAPITAL):
                           "stop" if pos["stop"] == pos["stop0"] else "breakeven", minute)
                 elif pos["target"] is not None and (favorable - pos["target"]) * sgn >= 0:
                     close(pos, pos["target"], "target", minute)
-                elif breakeven and pos["stop"] == pos["stop0"] and (favorable - pos["entry"]) * sgn >= abs(pos["entry"] - pos["stop0"]):
+                elif breakeven and pos["setup"].startswith("ORB") and pos["stop"] == pos["stop0"] \
+                        and (favorable - pos["entry"]) * sgn >= abs(pos["entry"] - pos["stop0"]):
                     pos["stop"] = pos["entry"]
             if not halted and equity - start_eq <= -pf.DAILY_LOSS_PCT / 100 * start_eq:
                 halted, pending = True, []
                 for pos in list(open_):
-                    i = pos_of[pos["symbol"]].get(minute)
-                    b = bars[pos["symbol"]]
-                    close(pos, b[4][i] if i is not None else b[4][max(j for m, j in pos_of[pos["symbol"]].items() if m <= minute)],
-                          "daily-loss-halt", minute)
+                    idx, b = pos_of[pos["symbol"]], bars[pos["symbol"]]
+                    close(pos, b[4][max(j for m, j in idx.items() if m <= minute)], "daily-loss-halt", minute)
             if minute >= until:
                 pending = []
-            for c in list(pending):  # armed stop-entries
+            for c in list(pending):  # armed ORB stop-entries
                 i = pos_of[c["symbol"]].get(minute)
                 if i is None:
                     continue
-                _, o, h, l, cl, _, _ = bars[c["symbol"]]
+                _, o, h, l, _, _, _ = bars[c["symbol"]]
                 sgn = 1 if c["side"] == "LONG" else -1
                 if ((h[i] if sgn > 0 else l[i]) - c["trigger"]) * sgn < 0:
                     continue
                 pending.remove(c)
-                if halted or opened >= pf.MAX_TRADES_PER_DAY or len(open_) >= pf.MAX_POSITIONS:
-                    continue
-                px = o[i] if (o[i] - c["trigger"]) * sgn > 0 else c["trigger"]
-                seg = c["segment"]
-                used = sum(q["qty"] * q["entry"] / pf.SEGMENTS[q["segment"]]["mult"] for q in open_)
-                pl = pf.plan(c["side"], px, c["stop"], None, equity, used, pf.SEGMENTS[seg]["mult"], seg)
-                if pl["problems"]:
-                    continue
-                e_side, _ = pf.sides(c["side"])
-                dist = abs(pl["entry"] - c["stop"])
-                pos = {"symbol": c["symbol"], "side": c["side"], "segment": seg, "qty": pl["qty"], "entry": pl["entry"],
-                       "stop": c["stop"], "stop0": c["stop"], "risk": pl["risk"], "cost_r": pl["cost_r"],
-                       "target": pl["entry"] + sgn * target_r * dist if target_r else None,
-                       "fees_in": pf.charges(e_side, pl["qty"] * pl["entry"]), "or_rvol": c["or_rvol"], "minute": minute}
-                open_.append(pos)
-                opened += 1
-                if ((l[i] if sgn > 0 else h[i]) - c["stop"]) * sgn <= 0:  # the trigger bar also reached the stop
-                    close(pos, c["stop"], "stop", minute)
+                enter(c, o[i] if (o[i] - c["trigger"]) * sgn > 0 else c["trigger"], None, orb_mult, minute, i)
+            if do_fades and minute in fade_at and not halted and len(open_) < pf.MAX_POSITIONS:
+                found = []
+                for sym, e in elig.items():
+                    if sym in used_syms or any(c["symbol"] == sym for c in pending):
+                        continue
+                    m, o, h, l, c, v, _ = B(sym)
+                    n = int((m < minute).sum())  # bars completed before the check time
+                    i = pos_of[sym].get(minute)
+                    if n < 6 or i is None or v[:n].sum() <= 0:
+                        continue
+                    vwap = float((((h[:n] + l[:n] + c[:n]) / 3) * v[:n]).sum() / v[:n].sum())
+                    plan, _ = strategy.fade_plan(float(c[n - 1]), vwap, e["atr"], e["or_rvol"], p)
+                    if plan and (plan["side"] == "LONG" or shortable(sym)):
+                        found.append(({"symbol": sym, "segment": e["segment"], **plan}, float(o[i]), i))
+                for c, px, i in sorted(found, key=lambda f: -abs(f[0]["stretch_atr"]))[:p["fade_top"]]:
+                    enter(c, px, c["target"], 1.0, minute, i)  # filled at the open of the next bar, as a market order
         for pos in list(open_):  # square-off: the open of the 15:15 bar, else the last price before it
             b, idx = bars[pos["symbol"]], pos_of[pos["symbol"]]
             later = [j for m, j in idx.items() if m >= SQUARE_OFF_MIN]
-            px = b[1][min(later)] if later else b[4][-1]
-            close(pos, px, "square-off", SQUARE_OFF_MIN)
+            close(pos, b[1][min(later)] if later else b[4][-1], "square-off", SQUARE_OFF_MIN)
     return trades
 
 
@@ -244,7 +283,9 @@ def report(ts, capital=pf.CAPITAL):
 
     out = {"from": str(days[0]), "to": str(days[-1]), "trading_days": len(days), **stats(ts),
            "return_pct": round((ts[-1]["equity"] / capital - 1) * 100, 1), "max_drawdown_pct": round(dd, 1),
-           "by_regime": by(lambda t: t["regime"]), "by_side": by(lambda t: t["side"]),
+           "by_regime": by(lambda t: t["regime"]), "by_setup": by(lambda t: t["setup"]),
+           "by_day_mode": by(lambda t: t["mode"]),
+           "by_setup_and_regime": by(lambda t: f"{t['setup']} / {t['regime']}"), "by_side": by(lambda t: t["side"]),
            "by_segment": by(lambda t: t["segment"]), "by_year": by(lambda t: t["day"].year),
            "by_exit": by(lambda t: t["reason"]),
            "by_half": by(lambda t: "first_half" if t["day"] < mid else "second_half")}
@@ -267,6 +308,9 @@ def verdict(r):
             fails.append(f"{name} regime has {g['n'] if g else 0} trades (need 30): untested there")
         elif g["exp_r"] <= 0:
             fails.append(f"loses in the {name} regime ({g['exp_r']}R over {g['n']} trades)")
+    for name, g in r["by_setup"].items():
+        if g["n"] >= 100 and g["exp_r"] <= 0:
+            fails.append(f"the {name} sleeve loses on its own ({g['exp_r']}R over {g['n']} trades): drop it, do not tune it")
     for name, g in r["by_half"].items():
         if g["exp_r"] <= 0:
             fails.append(f"negative in the {name.replace('_', ' ')} ({g['exp_r']}R): not stable over time")
@@ -354,6 +398,7 @@ def main():
     r.add_argument("--target-r", type=float, help="exit at this multiple of the stop distance (default: no target)")
     r.add_argument("--breakeven", action="store_true", help="move the stop to cost at +1R (the old rule)")
     r.add_argument("--sweep", action="store_true", help="grid over stop_atr and min_or_rvol")
+    r.add_argument("--sleeves", default="orb,fade", help="orb, fade or orb,fade (default). The news sleeve cannot be replayed")
     r.add_argument("--trades", help="write every trade to this CSV")
     a = ap.parse_args()
 
@@ -369,27 +414,30 @@ def main():
         k, v = kv.split("=", 1)
         if k not in p:
             sys.exit(f"Unknown parameter {k}. Known: {', '.join(p)}")
-        p[k] = type(p[k])(v)
+        p[k] = v.split(",") if isinstance(p[k], list) else type(p[k])(v)
     data = prepare(load(a.data, a.start, a.end), p)
     if not data:
         sys.exit("No usable CSVs (need 20 or more sessions per symbol).")
+    sleeves = tuple(x.strip() for x in a.sleeves.split(","))
     if a.sweep:
         grid = []
         for stop_atr in (0.25, 0.4, 0.6, 0.8):
             for rvol in (1.5, 2.0, 3.0):
-                s = stats(simulate(data, {**p, "stop_atr": stop_atr, "min_or_rvol": rvol}, a.target_r, a.breakeven))
+                s = stats(simulate(data, {**p, "stop_atr": stop_atr, "min_or_rvol": rvol}, a.target_r, a.breakeven,
+                                   sleeves=sleeves))
                 grid.append({"stop_atr": stop_atr, "min_or_rvol": rvol, **s})
         print(json.dumps({"note": "Trust a broad plateau of positive cells. One good cell among bad ones is curve fitting.",
                           "grid": grid}, indent=1))
         return
-    ts = simulate(data, p, a.target_r, a.breakeven)
+    ts = simulate(data, p, a.target_r, a.breakeven, sleeves=sleeves)
     if a.trades and ts:
         import csv
         with open(a.trades, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(ts[0]))
             w.writeheader()
             w.writerows(ts)
-    print(json.dumps({"params": p, "exit": {"target_r": a.target_r, "breakeven": a.breakeven}, **report(ts)}, indent=1))
+    print(json.dumps({"params": p, "sleeves": sleeves, "exit": {"target_r": a.target_r, "breakeven": a.breakeven},
+                      **report(ts)}, indent=1))
 
 
 if __name__ == "__main__":
